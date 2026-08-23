@@ -8,7 +8,10 @@
 //! `7285dd5c6a7ec5f1c0e521c6ee71f70e659d6220`; see THIRD-PARTY-NOTICES.md.
 //! orihsus's key-pool/retry/quota/product semantics are not imported. The
 //! token-accounting basis (mutually exclusive input buckets, derived `uncached`,
-//! non-negativity) follows DESIGN.md §4.
+//! non-negativity) follows DESIGN.md §4. The present-but-invalid counter
+//! distinction (`pick_counter`) is bespoke: orihsus reads counters with
+//! `.as_u64()` only, which collapses a present-invalid value into absent for
+//! optional counters and into whole-usage failure for required ones.
 //!
 //! [ariga39/orihsus]: https://github.com/ariga39/orihsus
 
@@ -227,6 +230,7 @@ pub(crate) struct SseUsageParser {
     terminal_incomplete: bool,
     terminal_seen: bool,
     usage_malformed: bool,
+    malformed_counter: bool,
     model: Option<String>,
     usage: Option<(Usage, AccountingQuality)>,
 }
@@ -243,6 +247,7 @@ impl SseUsageParser {
             terminal_incomplete: false,
             terminal_seen: false,
             usage_malformed: false,
+            malformed_counter: false,
             model: None,
             usage: None,
         }
@@ -310,7 +315,9 @@ impl SseUsageParser {
         match response.get("usage") {
             None | Some(serde_json::Value::Null) => {}
             Some(usage) if usage.is_object() => {
-                self.usage = Some(canonicalize(extract_raw_usage(usage)));
+                let (raw, malformed) = extract_raw_usage(usage);
+                self.malformed_counter |= malformed;
+                self.usage = Some(canonicalize(raw, malformed));
             }
             Some(_) => self.usage_malformed = true,
         }
@@ -333,6 +340,7 @@ impl SseUsageParser {
                 .map(|(_, quality)| quality)
                 .unwrap_or(AccountingQuality::Unavailable),
             metering_error: match &self.usage {
+                Some(_) if self.malformed_counter => Some(MeteringError::MalformedUsage),
                 Some(_) => None,
                 None if self.oversized => Some(MeteringError::EventTooLarge),
                 None if self.usage_malformed => Some(MeteringError::MalformedUsage),
@@ -430,12 +438,13 @@ impl JsonUsageParser {
                 ..AuditResult::default()
             },
             Some(usage) if usage.is_object() => {
-                let (usage, quality) = canonicalize(extract_raw_usage(usage));
+                let (raw, malformed) = extract_raw_usage(usage);
+                let (usage, quality) = canonicalize(raw, malformed);
                 AuditResult {
                     model,
                     usage: Some(usage),
                     quality,
-                    metering_error: None,
+                    metering_error: malformed.then_some(MeteringError::MalformedUsage),
                 }
             }
             Some(_) => AuditResult {
@@ -459,74 +468,99 @@ struct RawUsage {
     total: Option<u64>,
 }
 
+/// Read one token counter from the first *present* candidate path (in priority
+/// order). Distinguishes a genuinely absent counter (`Ok(None)`, also for an
+/// explicit `null`) from a counter that is present but not a valid non-negative
+/// integer (`Err(())`). A higher-priority candidate that is present but invalid
+/// is malformed — it is not silently skipped in favor of a lower-priority
+/// fallback. This is the basis of `metering_error=malformed_usage` being
+/// distinct from a missing counter (DESIGN.md §5).
+fn pick_counter(usage: &serde_json::Value, paths: &[&[&str]]) -> Result<Option<u64>, ()> {
+    for &path in paths {
+        let mut cur = usage;
+        let mut present = true;
+        for key in path {
+            match cur.get(key) {
+                Some(value) => cur = value,
+                None => {
+                    present = false;
+                    break;
+                }
+            }
+        }
+        if !present || cur.is_null() {
+            continue;
+        }
+        return match cur.as_u64() {
+            Some(count) => Ok(Some(count)),
+            None => Err(()),
+        };
+    }
+    Ok(None)
+}
+
 /// Read the token counters from a Responses terminal `usage` object. Candidate
 /// field names cover the Responses API shape observed in the OpenAI Codex
 /// source and the community chat-completion legacy names; absent fields stay
-/// absent (never defaulted to 0).
-fn extract_raw_usage(usage: &serde_json::Value) -> RawUsage {
-    let nested = |path: &[&str]| {
-        let mut cur = usage;
-        for key in path {
-            cur = cur.get(key)?;
-        }
-        cur.as_u64()
-    };
-    RawUsage {
-        input_total: usage
-            .get("input_tokens")
-            .or_else(|| usage.get("prompt_tokens"))
-            .and_then(serde_json::Value::as_u64),
-        cache_read: nested(&["input_tokens_details", "cached_tokens"])
-            .or_else(|| {
-                usage
-                    .get("prompt_cache_hit_tokens")
-                    .and_then(serde_json::Value::as_u64)
-            })
-            .or_else(|| {
-                usage
-                    .get("cache_read_input_tokens")
-                    .and_then(serde_json::Value::as_u64)
-            }),
-        cache_write: nested(&["input_tokens_details", "cache_write_tokens"])
-            .or_else(|| {
-                usage
-                    .get("cache_write_input_tokens")
-                    .and_then(serde_json::Value::as_u64)
-            })
-            .or_else(|| {
-                usage
-                    .get("cache_write_tokens")
-                    .and_then(serde_json::Value::as_u64)
-            })
-            .or_else(|| {
-                usage
-                    .get("cache_creation_input_tokens")
-                    .and_then(serde_json::Value::as_u64)
-            })
-            .or_else(|| nested(&["prompt_tokens_details", "cache_write_tokens"])),
-        output_total: usage
-            .get("output_tokens")
-            .or_else(|| usage.get("completion_tokens"))
-            .and_then(serde_json::Value::as_u64),
-        reasoning: nested(&["output_tokens_details", "reasoning_tokens"])
-            .or_else(|| nested(&["completion_tokens_details", "reasoning_tokens"]))
-            .or_else(|| {
-                usage
-                    .get("reasoning_tokens")
-                    .and_then(serde_json::Value::as_u64)
-            }),
-        total: usage
-            .get("total_tokens")
-            .and_then(serde_json::Value::as_u64),
-    }
+/// absent (never defaulted to 0). Returns the counters and whether any
+/// recognized counter was present but not a valid non-negative integer.
+fn extract_raw_usage(usage: &serde_json::Value) -> (RawUsage, bool) {
+    let input_total = pick_counter(usage, &[&["input_tokens"], &["prompt_tokens"]]);
+    let cache_read = pick_counter(
+        usage,
+        &[
+            &["input_tokens_details", "cached_tokens"],
+            &["prompt_cache_hit_tokens"],
+            &["cache_read_input_tokens"],
+        ],
+    );
+    let cache_write = pick_counter(
+        usage,
+        &[
+            &["input_tokens_details", "cache_write_tokens"],
+            &["cache_write_input_tokens"],
+            &["cache_write_tokens"],
+            &["cache_creation_input_tokens"],
+            &["prompt_tokens_details", "cache_write_tokens"],
+        ],
+    );
+    let output_total = pick_counter(usage, &[&["output_tokens"], &["completion_tokens"]]);
+    let reasoning = pick_counter(
+        usage,
+        &[
+            &["output_tokens_details", "reasoning_tokens"],
+            &["completion_tokens_details", "reasoning_tokens"],
+            &["reasoning_tokens"],
+        ],
+    );
+    let total = pick_counter(usage, &[&["total_tokens"]]);
+    let malformed = matches!(input_total, Err(()))
+        || matches!(cache_read, Err(()))
+        || matches!(cache_write, Err(()))
+        || matches!(output_total, Err(()))
+        || matches!(reasoning, Err(()))
+        || matches!(total, Err(()));
+    (
+        RawUsage {
+            input_total: input_total.unwrap_or(None),
+            cache_read: cache_read.unwrap_or(None),
+            cache_write: cache_write.unwrap_or(None),
+            output_total: output_total.unwrap_or(None),
+            reasoning: reasoning.unwrap_or(None),
+            total: total.unwrap_or(None),
+        },
+        malformed,
+    )
 }
 
 /// Canonicalize upstream counters into the DESIGN.md §4 accounting basis:
 /// `input_total = uncached + cache_read + cache_write` with mutually exclusive
 /// buckets. `uncached` is derived only when all required input details are
 /// present and satisfy the non-negativity invariant; otherwise it is null.
-/// Contradictory data keeps the upstream value and is marked `inconsistent`.
-fn canonicalize(raw: RawUsage) -> (Usage, AccountingQuality) {
+/// Contradictory data keeps the upstream value and is marked `inconsistent`. A
+/// counter that is present but invalid keeps the valid counters, records the
+/// invalid counter as null, and downgrades the quality to `partial`.
+fn canonicalize(raw: RawUsage, malformed: bool) -> (Usage, AccountingQuality) {
     let (uncached, quality) = match (raw.input_total, raw.cache_read, raw.cache_write) {
         (Some(input), Some(read), Some(write)) => {
             if input >= read.saturating_add(write) {
@@ -547,7 +581,11 @@ fn canonicalize(raw: RawUsage) -> (Usage, AccountingQuality) {
             reasoning: raw.reasoning,
             total: raw.total,
         },
-        quality,
+        if malformed {
+            AccountingQuality::Partial
+        } else {
+            quality
+        },
     )
 }
 

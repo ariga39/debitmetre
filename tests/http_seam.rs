@@ -290,6 +290,123 @@ async fn accepted_streaming_response_is_forwarded_unchanged_and_records_known_us
     }
 }
 
+/// A synthetic Responses SSE terminal event (DESIGN.md §4) whose usage object
+/// mixes valid numeric counters (input_total=12, cache_read=4, cache_write=2,
+/// output_total=5, total=17, so uncached = 12-4-2 = 6) with one counter that is
+/// present but not a valid number: `output_tokens_details.reasoning_tokens` is
+/// an obviously synthetic string. The gateway must forward the response
+/// unchanged, keep the valid counters, record the invalid counter as null, and
+/// classify the record as `accounting_quality=partial` with
+/// `metering_error=malformed_usage` — distinct from a genuinely missing counter,
+/// which stays null with no metering error (see
+/// `accepted_compact_request_records_its_own_line_with_absent_counters_absent`).
+const MALFORMED_USAGE_SSE_FIXTURE: &str = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-synthetic-14\",\"model\":\"synthetic-model-001\",\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":4,\"cache_write_tokens\":2},\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":\"synthetic-not-a-number\"},\"total_tokens\":17}}}\n\n";
+
+#[tokio::test]
+async fn terminal_usage_with_present_but_invalid_counter_is_forwarded_and_records_partial_malformed(
+) {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![
+            ("content-type".to_string(), "text/event-stream".to_string()),
+            (
+                "x-codex-semantic".to_string(),
+                "malformed-usage-semantic-01".to_string(),
+            ),
+        ],
+        body: MALFORMED_USAGE_SSE_FIXTURE.as_bytes().to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-semantic")
+            .and_then(|v| v.to_str().ok()),
+        Some("malformed-usage-semantic-01"),
+        "caller-visible upstream headers preserved"
+    );
+    assert_eq!(
+        response
+            .bytes()
+            .await
+            .expect("gateway response body")
+            .as_ref(),
+        MALFORMED_USAGE_SSE_FIXTURE.as_bytes(),
+        "caller-visible response bytes are byte-for-byte the upstream SSE"
+    );
+
+    let record = wait_for_jsonl_record(&usage_file).await;
+    assert_eq!(
+        read_jsonl(&usage_file).len(),
+        1,
+        "exactly one audit record per accepted request"
+    );
+    assert_eq!(record["kind"], "request");
+    assert_eq!(record["operation"], "response");
+    assert_eq!(record["machine_id"], "machine-a");
+    assert_eq!(record["upstream_status"], 200);
+    assert_eq!(record["outcome"], "completed");
+    assert_eq!(record["model"], "synthetic-model-001");
+    assert_eq!(record["accounting_quality"], "partial");
+    assert_eq!(
+        record["metering_error"], "malformed_usage",
+        "a present-but-invalid counter is malformed, never silently missing"
+    );
+
+    let usage = &record["usage"];
+    assert_eq!(usage["input_total"], 12);
+    assert_eq!(usage["uncached"], 6);
+    assert_eq!(usage["cache_read"], 4);
+    assert_eq!(usage["cache_write"], 2);
+    assert_eq!(usage["output_total"], 5);
+    assert_eq!(usage["total"], 17);
+    assert!(
+        usage["reasoning"].is_null(),
+        "the present-but-invalid counter is recorded as null, never a guessed value"
+    );
+
+    let serialized = serde_json::to_string(&record).expect("record serializes");
+    for forbidden in [
+        "test-meter-key-machine-a",
+        "opaque-request-body-42",
+        "resp-synthetic-14",
+        "synthetic-not-a-number",
+        "response.completed",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "usage record must never contain {forbidden:?} (privacy allowlist)"
+        );
+    }
+}
+
 /// A synthetic non-streaming compact response (DESIGN.md §11: the real compact
 /// response shape is pending PoC, so this uses a conservative JSON body) with
 /// only `input_total` and `output_total` present: the absent counters must stay
