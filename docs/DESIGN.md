@@ -96,8 +96,8 @@ Request headers follow an explicit stripping policy that prioritizes compatibili
   event-field scanner fed every byte of the event (including bytes beyond the retained cap while
   discarding): an oversized discarded event's terminal kind is decided at its completed delimiter by the
   last line-start `event:` field (SSE last-field-wins, exact whitespace semantics), while a partial event
-  truncated before the delimiter is never delivered. The scanner is adapted from the codex-proxy
-  `src/audit.rs` constant-size streaming scanner, with its whitespace handling corrected.
+  truncated before the delimiter is never delivered. The constant-size field scanner is reused/adapted
+  from prior local code, with its whitespace handling corrected.
 
 ## 5. Audit (canonical request audit)
 

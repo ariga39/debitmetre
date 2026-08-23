@@ -242,10 +242,12 @@ enum FieldScan {
     Idle,
     /// Matching the literal `event:` prefix (bytes matched so far).
     Prefix(usize),
-    /// Reading the event name after the colon into the bounded name buffer.
-    /// `skipped_space` records whether the single optional leading U+0020 was
-    /// consumed.
-    Name { skipped_space: bool },
+    /// The byte immediately after the colon: this is the only position where the
+    /// single optional leading U+0020 may be removed.
+    AfterColon,
+    /// Reading the event name value into the bounded name buffer; every byte,
+    /// including a later or trailing space, is retained.
+    Name,
 }
 
 /// A supported terminal SSE event kind named by the last `event:` field of a
@@ -418,8 +420,9 @@ impl SseUsageParser {
 
     /// Constant-size scan of one byte for a supported terminal `event:` name at
     /// a line start. Retains at most [`EVENT_NAME_CAP`] bytes of the name and
-    /// tracks the last completed `event:` field (SSE last-field-wins). Adapted
-    /// from the bounded streaming scanner in the codex-proxy `src/audit.rs`.
+    /// tracks the last completed `event:` field (SSE last-field-wins). The
+    /// scanner is reused/adapted from a prior constant-size streaming
+    /// implementation.
     fn scan_event_field(&mut self, b: u8) {
         if b == b'\n' {
             self.line_start = true;
@@ -439,9 +442,7 @@ impl SseUsageParser {
                 if b == EVENT_FIELD[matched] {
                     let next = matched + 1;
                     if next == EVENT_FIELD.len() {
-                        self.field = FieldScan::Name {
-                            skipped_space: false,
-                        };
+                        self.field = FieldScan::AfterColon;
                     } else {
                         self.field = FieldScan::Prefix(next);
                     }
@@ -449,18 +450,27 @@ impl SseUsageParser {
                     self.field = FieldScan::Idle;
                 }
             }
-            FieldScan::Name { skipped_space } => {
+            FieldScan::AfterColon => {
+                if b == b' ' {
+                    // Remove at most one leading U+0020, only here at the first
+                    // byte after the colon.
+                    self.field = FieldScan::Name;
+                } else if b == b'\n' || b == b'\r' {
+                    self.finish_event_name();
+                    self.field = FieldScan::Idle;
+                } else {
+                    self.name[self.name_len] = b;
+                    self.name_len += 1;
+                    self.field = FieldScan::Name;
+                }
+            }
+            FieldScan::Name => {
                 if b == b'\n' || b == b'\r' {
                     self.finish_event_name();
                     self.field = FieldScan::Idle;
-                } else if !skipped_space && b == b' ' {
-                    // Remove at most one leading U+0020 after the colon; every
-                    // other byte (tabs, a second leading space, trailing
-                    // whitespace) is kept and compared exactly.
-                    self.field = FieldScan::Name {
-                        skipped_space: true,
-                    };
                 } else if self.name_len < EVENT_NAME_CAP {
+                    // Every byte is retained verbatim, including a later or
+                    // trailing space, tab, or second leading space.
                     self.name[self.name_len] = b;
                     self.name_len += 1;
                 } else {
