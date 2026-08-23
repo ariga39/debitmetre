@@ -886,6 +886,250 @@ async fn oversized_terminal_field_truncated_before_delimiter_is_upstream_interru
     assert_eq!(record["metering_error"], "missing_usage");
 }
 
+/// An oversized event whose early `event: response.completed` field is followed,
+/// after more than `SSE_EVENT_CAP` data bytes, by a later line-start
+/// `event: response.output_text.delta` field before the complete delimiter
+/// (issue #20 PR review): SSE last-field-wins applies across the whole event,
+/// so clean EOF has no supported terminal and the audit is `upstream_interrupted`
+/// with `missing_usage`.
+#[tokio::test]
+async fn oversized_event_last_event_field_wins_across_retained_cap() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    let pad = "x".repeat(256 * 1024);
+    let body = format!(
+        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"output\":[{{\"type\":\"output_text\",\"text\":\"{pad}\"}}]}}}}\nevent: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"synthetic\"}}\n\n"
+    );
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![
+            ("content-type".to_string(), "text/event-stream".to_string()),
+            (
+                "x-codex-semantic".to_string(),
+                "last-field-wins-semantic-01".to_string(),
+            ),
+        ],
+        body: body.as_bytes().to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-semantic")
+            .and_then(|v| v.to_str().ok()),
+        Some("last-field-wins-semantic-01"),
+        "caller-visible upstream headers preserved"
+    );
+    assert_eq!(
+        response
+            .bytes()
+            .await
+            .expect("gateway response body")
+            .as_ref(),
+        body.as_bytes(),
+        "caller-visible response bytes are byte-for-byte the upstream SSE body"
+    );
+
+    let record = wait_for_jsonl_record(&usage_file).await;
+    assert_eq!(record["kind"], "request");
+    assert_eq!(record["operation"], "response");
+    assert_eq!(record["upstream_status"], 200);
+    assert_eq!(
+        record["outcome"], "upstream_interrupted",
+        "the last event: field in the oversized event must win, even beyond the retained cap"
+    );
+    assert!(record["usage"].is_null());
+    assert_eq!(record["accounting_quality"], "unavailable");
+    assert_eq!(record["metering_error"], "missing_usage");
+}
+
+/// An oversized event with an early nonterminal field and, after more than
+/// `SSE_EVENT_CAP` data bytes, a later line-start `event: response.completed`
+/// field before the complete delimiter (issue #20 PR review): the last `event:`
+/// field wins even beyond the retained cap, so the audit is `completed` with
+/// `event_too_large`.
+#[tokio::test]
+async fn oversized_event_terminal_field_after_retained_cap_is_completed() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    let pad = "x".repeat(256 * 1024);
+    let body = format!(
+        "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"{pad}\"}}\nevent: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-late\"}}}}\n\n"
+    );
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![
+            ("content-type".to_string(), "text/event-stream".to_string()),
+            (
+                "x-codex-semantic".to_string(),
+                "late-terminal-semantic-01".to_string(),
+            ),
+        ],
+        body: body.as_bytes().to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-semantic")
+            .and_then(|v| v.to_str().ok()),
+        Some("late-terminal-semantic-01"),
+        "caller-visible upstream headers preserved"
+    );
+    assert_eq!(
+        response
+            .bytes()
+            .await
+            .expect("gateway response body")
+            .as_ref(),
+        body.as_bytes(),
+        "caller-visible response bytes are byte-for-byte the upstream SSE body"
+    );
+
+    let record = wait_for_jsonl_record(&usage_file).await;
+    assert_eq!(record["kind"], "request");
+    assert_eq!(record["operation"], "response");
+    assert_eq!(record["upstream_status"], 200);
+    assert_eq!(
+        record["outcome"], "completed",
+        "the terminal event: field after the retained cap must still establish the terminal outcome"
+    );
+    assert!(record["usage"].is_null());
+    assert_eq!(record["accounting_quality"], "unavailable");
+    assert_eq!(record["metering_error"], "event_too_large");
+}
+
+/// An oversized event whose `event:` field has a trailing U+0020 after the name
+/// (issue #20 PR review): SSE field whitespace removes at most one leading space
+/// after the colon and preserves trailing whitespace, so
+/// `event: response.completed ` is not a supported terminal and the audit is
+/// `upstream_interrupted` with `missing_usage`.
+#[tokio::test]
+async fn oversized_event_field_trailing_space_is_not_terminal() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    let pad = "x".repeat(256 * 1024);
+    let body = format!(
+        "event: response.completed \ndata: {{\"type\":\"response.completed\",\"response\":{{\"output\":[{{\"type\":\"output_text\",\"text\":\"{pad}\"}}]}}}}\n\n"
+    );
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![
+            ("content-type".to_string(), "text/event-stream".to_string()),
+            (
+                "x-codex-semantic".to_string(),
+                "trailing-space-semantic-01".to_string(),
+            ),
+        ],
+        body: body.as_bytes().to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-semantic")
+            .and_then(|v| v.to_str().ok()),
+        Some("trailing-space-semantic-01"),
+        "caller-visible upstream headers preserved"
+    );
+    assert_eq!(
+        response
+            .bytes()
+            .await
+            .expect("gateway response body")
+            .as_ref(),
+        body.as_bytes(),
+        "caller-visible response bytes are byte-for-byte the upstream SSE body"
+    );
+
+    let record = wait_for_jsonl_record(&usage_file).await;
+    assert_eq!(record["kind"], "request");
+    assert_eq!(record["operation"], "response");
+    assert_eq!(record["upstream_status"], 200);
+    assert_eq!(
+        record["outcome"], "upstream_interrupted",
+        "a trailing-space event name is not a supported terminal"
+    );
+    assert!(record["usage"].is_null());
+    assert_eq!(record["accounting_quality"], "unavailable");
+    assert_eq!(record["metering_error"], "missing_usage");
+}
+
 /// A synthetic non-streaming compact response (DESIGN.md §11: the real compact
 /// response shape is pending PoC, so this uses a conservative JSON body) with
 /// only `input_total` and `output_total` present: the absent counters must stay

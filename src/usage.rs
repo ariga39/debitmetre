@@ -227,6 +227,35 @@ impl StreamUsageParser {
     }
 }
 
+/// Literal prefix of an SSE `event:` field line.
+const EVENT_FIELD: &[u8] = b"event:";
+
+/// Maximum bytes of an SSE event name retained by the field scanner; larger
+/// than any supported terminal name (`response.incomplete` is 19 bytes), so the
+/// scanner state stays constant-size.
+const EVENT_NAME_CAP: usize = 24;
+
+/// Progressive state for scanning a single SSE `event:` field line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FieldScan {
+    /// Not inside an `event:` field.
+    Idle,
+    /// Matching the literal `event:` prefix (bytes matched so far).
+    Prefix(usize),
+    /// Reading the event name after the colon into the bounded name buffer.
+    /// `skipped_space` records whether the single optional leading U+0020 was
+    /// consumed.
+    Name { skipped_space: bool },
+}
+
+/// A supported terminal SSE event kind named by the last `event:` field of a
+/// discarded oversized event completed at its delimiter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OversizedTerminalKind {
+    Completed,
+    Incomplete,
+}
+
 /// Bounded incremental SSE parser: extracts usage and model from the terminal
 /// `response.completed` / `response.incomplete` events without accumulating the
 /// whole stream (DESIGN.md §4.1). Handles LF (`\n\n`) and CRLF (`\r\n\r\n`)
@@ -253,6 +282,19 @@ pub(crate) struct SseUsageParser {
     /// Whether a discarded oversized event completed at its delimiter with a
     /// line-start `event:` field naming `response.incomplete`.
     oversized_terminal_incomplete: bool,
+    /// True at a line start (start of stream or after a newline), where an
+    /// `event:` field may begin. Constant-size field scanner state.
+    line_start: bool,
+    /// Progressive scanner state for the current `event:` field line.
+    field: FieldScan,
+    /// Bounded name buffer for the current `event:` field.
+    name: [u8; EVENT_NAME_CAP],
+    name_len: usize,
+    /// The supported terminal kind named by the last `event:` field completed
+    /// in the current in-flight event; `None` for an unsupported or too-long
+    /// name. Reset only at a completed event delimiter; a partial event at EOF
+    /// is never finalized.
+    last_terminal: Option<OversizedTerminalKind>,
     model: Option<String>,
     usage: Option<(Usage, AccountingQuality)>,
 }
@@ -272,6 +314,11 @@ impl SseUsageParser {
             saw_event: false,
             oversized_terminal_completed: false,
             oversized_terminal_incomplete: false,
+            line_start: true,
+            field: FieldScan::Idle,
+            name: [0; EVENT_NAME_CAP],
+            name_len: 0,
+            last_terminal: None,
             model: None,
             usage: None,
         }
@@ -279,6 +326,11 @@ impl SseUsageParser {
 
     fn push(&mut self, chunk: &[u8]) {
         for &b in chunk {
+            // The constant-size field scanner is fed every byte of the event,
+            // including bytes after `event_cap` while discarding, so `event:`
+            // fields after the retained head participate and the last field
+            // wins.
+            self.scan_event_field(b);
             if self.tail_len == 4 {
                 self.tail.copy_within(1..4, 0);
                 self.tail[3] = b;
@@ -292,14 +344,14 @@ impl SseUsageParser {
                 if !self.discarding {
                     self.consume_event(&event);
                 } else {
-                    // Bounded terminal-name observation of an oversized event,
-                    // only at its completed delimiter, from line-start `event:`
-                    // fields (last field wins). A partial event is never a
-                    // delivered terminal (DESIGN.md §4.1).
+                    // The field scanner saw every byte of the oversized event,
+                    // so the final `event:` field (last field wins) decides the
+                    // terminal kind at the completed delimiter. A partial event
+                    // is never a delivered terminal (DESIGN.md §4.1).
                     if prefix_has_sse_framing(&event) {
                         self.saw_event = true;
                     }
-                    match event_field_terminal(&event) {
+                    match self.last_terminal {
                         Some(OversizedTerminalKind::Completed) => {
                             self.oversized_terminal_completed = true;
                         }
@@ -311,6 +363,7 @@ impl SseUsageParser {
                 }
                 self.discarding = false;
                 self.tail_len = 0;
+                self.reset_event_field_scan();
             } else if !self.discarding {
                 if self.event_buf.len() < self.event_cap {
                     self.event_buf.push(b);
@@ -361,6 +414,86 @@ impl SseUsageParser {
             }
             Some(_) => self.usage_malformed = true,
         }
+    }
+
+    /// Constant-size scan of one byte for a supported terminal `event:` name at
+    /// a line start. Retains at most [`EVENT_NAME_CAP`] bytes of the name and
+    /// tracks the last completed `event:` field (SSE last-field-wins). Adapted
+    /// from the bounded streaming scanner in the codex-proxy `src/audit.rs`.
+    fn scan_event_field(&mut self, b: u8) {
+        if b == b'\n' {
+            self.line_start = true;
+        }
+        match self.field {
+            FieldScan::Idle => {
+                if self.line_start {
+                    if b == b'e' {
+                        self.field = FieldScan::Prefix(1);
+                        self.line_start = false;
+                    } else if b != b'\n' {
+                        self.line_start = false;
+                    }
+                }
+            }
+            FieldScan::Prefix(matched) => {
+                if b == EVENT_FIELD[matched] {
+                    let next = matched + 1;
+                    if next == EVENT_FIELD.len() {
+                        self.field = FieldScan::Name {
+                            skipped_space: false,
+                        };
+                    } else {
+                        self.field = FieldScan::Prefix(next);
+                    }
+                } else {
+                    self.field = FieldScan::Idle;
+                }
+            }
+            FieldScan::Name { skipped_space } => {
+                if b == b'\n' || b == b'\r' {
+                    self.finish_event_name();
+                    self.field = FieldScan::Idle;
+                } else if !skipped_space && b == b' ' {
+                    // Remove at most one leading U+0020 after the colon; every
+                    // other byte (tabs, a second leading space, trailing
+                    // whitespace) is kept and compared exactly.
+                    self.field = FieldScan::Name {
+                        skipped_space: true,
+                    };
+                } else if self.name_len < EVENT_NAME_CAP {
+                    self.name[self.name_len] = b;
+                    self.name_len += 1;
+                } else {
+                    // A name longer than any supported terminal name makes the
+                    // current field unsupported, overwriting an earlier value.
+                    self.last_terminal = None;
+                    self.field = FieldScan::Idle;
+                    self.name_len = 0;
+                }
+            }
+        }
+    }
+
+    fn finish_event_name(&mut self) {
+        // Exact, whitespace-preserving comparison: only the single optional
+        // leading U+0020 was removed by the scanner, so the name must match a
+        // supported terminal exactly (no tab, extra-space, or trailing-space
+        // trimming).
+        self.last_terminal = match &self.name[..self.name_len] {
+            b"response.completed" => Some(OversizedTerminalKind::Completed),
+            b"response.incomplete" => Some(OversizedTerminalKind::Incomplete),
+            _ => None,
+        };
+        self.name_len = 0;
+    }
+
+    /// Reset the field scanner at a completed event delimiter. A partial event
+    /// at EOF is never finalized and never resets here.
+    fn reset_event_field_scan(&mut self) {
+        self.line_start = true;
+        self.field = FieldScan::Idle;
+        self.name_len = 0;
+        self.last_terminal = None;
     }
 
     fn incomplete(&self) -> bool {
@@ -427,48 +560,6 @@ fn prefix_has_sse_framing(bytes: &[u8]) -> bool {
             || line.starts_with(b"id:")
             || line.starts_with(b"retry:")
     })
-}
-
-/// The supported terminal kind named by the last line-start `event:` field in a
-/// bounded SSE-event prefix, per SSE field semantics (the last `event:` field
-/// wins). Terminal text inside `data:`, `id:`, `retry:`, or arbitrary bytes is
-/// never recognized. Returns `None` when the last `event:` field is not a
-/// supported terminal or there is no `event:` field.
-fn event_field_terminal(bytes: &[u8]) -> Option<OversizedTerminalKind> {
-    let mut terminal = None;
-    for line in bytes.split(|&b| b == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let Some(value) = line.strip_prefix(b"event:") else {
-            continue;
-        };
-        let value = trim_ascii_space(value);
-        terminal = match value {
-            b"response.completed" => Some(OversizedTerminalKind::Completed),
-            b"response.incomplete" => Some(OversizedTerminalKind::Incomplete),
-            _ => None,
-        };
-    }
-    terminal
-}
-
-fn trim_ascii_space(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    let end = bytes
-        .iter()
-        .rposition(|b| !b.is_ascii_whitespace())
-        .map_or(start, |i| i + 1);
-    &bytes[start..end]
-}
-
-/// A supported terminal SSE event kind recognized from a line-start `event:`
-/// field of a discarded oversized event (see [`event_field_terminal`]).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum OversizedTerminalKind {
-    Completed,
-    Incomplete,
 }
 
 /// Bounded side-band observer for a non-streaming (`application/json`) response

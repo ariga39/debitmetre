@@ -92,10 +92,12 @@ Request headers follow an explicit stripping policy that prioritizes compatibili
   (the crate used by the pinned Codex client). That crate has no per-event size cap, and observing through
   a transparent tee would require either blocking, dropping, or unbounded buffering of the side channel,
   plus separate cancellation coordination between the response pump and the observer. The pinned
-  orihsus bounded SSE parser (`src/gateway.rs`) is adapted instead, with a tiny bounded terminal-name
-  observation: an oversized discarded event's already-buffered prefix is scanned at its completed delimiter
-  for a line-start `event:` field (last field wins), so an oversized terminal event keeps its terminal
-  outcome while a partial event truncated before the delimiter is never delivered.
+  orihsus bounded SSE parser (`src/gateway.rs`) is adapted instead, with a constant-size streaming
+  event-field scanner fed every byte of the event (including bytes beyond the retained cap while
+  discarding): an oversized discarded event's terminal kind is decided at its completed delimiter by the
+  last line-start `event:` field (SSE last-field-wins, exact whitespace semantics), while a partial event
+  truncated before the delimiter is never delivered. The scanner is adapted from the codex-proxy
+  `src/audit.rs` constant-size streaming scanner, with its whitespace handling corrected.
 
 ## 5. Audit (canonical request audit)
 
