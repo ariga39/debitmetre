@@ -6,8 +6,9 @@ This project selectively ports and adapts compatible building blocks from the
 independent Codex gateway [ariga39/orihsus](https://github.com/ariga39/orihsus)
 at the pinned revision `7285dd5c6a7ec5f1c0e521c6ee71f70e659d6220`:
 
-- `StreamUsageParser`, `JsonUsageParser`, and `SseUsageParser` are adapted from
-  `src/gateway.rs` (lines around 2261, 2294, and 2336 respectively).
+- `StreamUsageParser` / `SseUsageParser` (the streaming SSE usage extractor,
+  with its non-streaming JSON fallback) are adapted from `src/gateway.rs`
+  (lines around 2261, 2294, and 2336 respectively).
 - The bounded single-writer JSONL audit writer is adapted from `src/audit.rs`
   (lines around 291, 504, and 527 respectively).
 - `DropNotifyStream` and its response-pump select pattern (client-cancel

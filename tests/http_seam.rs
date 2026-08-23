@@ -290,6 +290,100 @@ async fn accepted_streaming_response_is_forwarded_unchanged_and_records_known_us
     }
 }
 
+/// A synthetic Responses SSE terminal event under a body labeled
+/// `application/json` (issue #20): the real Codex Responses client feeds the
+/// response byte stream to its SSE parser regardless of the upstream
+/// Content-Type, so an SSE-framed `response.completed` can arrive with a JSON
+/// Content-Type. Token counts are the known ones from
+/// `STREAMING_RESPONSE_FIXTURE`: input_total=12, cache_read=4, cache_write=2,
+/// output_total=5, reasoning=2, total=17, so uncached = 12-4-2 = 6 and the
+/// accounting_quality is `complete`.
+const JSON_LABELED_SSE_RESPONSE_FIXTURE: &str = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-synthetic-json-label\",\"model\":\"synthetic-model-001\",\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":4,\"cache_write_tokens\":2},\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":2},\"total_tokens\":17}}}\n\n";
+
+#[tokio::test]
+async fn json_labeled_sse_response_is_forwarded_unchanged_and_records_known_usage() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                "x-codex-semantic".to_string(),
+                "json-label-semantic-01".to_string(),
+            ),
+        ],
+        body: JSON_LABELED_SSE_RESPONSE_FIXTURE.as_bytes().to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-semantic")
+            .and_then(|v| v.to_str().ok()),
+        Some("json-label-semantic-01"),
+        "caller-visible upstream headers preserved"
+    );
+    assert_eq!(
+        response
+            .bytes()
+            .await
+            .expect("gateway response body")
+            .as_ref(),
+        JSON_LABELED_SSE_RESPONSE_FIXTURE.as_bytes(),
+        "caller-visible response bytes are byte-for-byte the upstream SSE body"
+    );
+
+    let record = wait_for_jsonl_record(&usage_file).await;
+    assert_eq!(
+        read_jsonl(&usage_file).len(),
+        1,
+        "exactly one audit record per accepted request"
+    );
+    assert_eq!(record["kind"], "request");
+    assert_eq!(record["operation"], "response");
+    assert_eq!(record["machine_id"], "machine-a");
+    assert_eq!(record["upstream_status"], 200);
+    assert_eq!(record["outcome"], "completed");
+    assert_eq!(record["model"], "synthetic-model-001");
+    assert_eq!(record["accounting_quality"], "complete");
+    assert!(record["metering_error"].is_null());
+
+    let usage = &record["usage"];
+    assert_eq!(usage["input_total"], 12);
+    assert_eq!(usage["uncached"], 6);
+    assert_eq!(usage["cache_read"], 4);
+    assert_eq!(usage["cache_write"], 2);
+    assert_eq!(usage["output_total"], 5);
+    assert_eq!(usage["reasoning"], 2);
+    assert_eq!(usage["total"], 17);
+}
+
 /// A synthetic non-streaming compact response (DESIGN.md §11: the real compact
 /// response shape is pending PoC, so this uses a conservative JSON body) with
 /// only `input_total` and `output_total` present: the absent counters must stay

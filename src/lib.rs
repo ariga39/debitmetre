@@ -257,7 +257,6 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
                 filtered_headers.push((name.clone(), value.clone()));
             }
 
-            let streaming = is_event_stream(&filtered_headers);
             let (tx, rx) =
                 tokio::sync::mpsc::channel::<Result<Bytes, std::convert::Infallible>>(16);
             let client_gone = Arc::new(tokio::sync::Notify::new());
@@ -266,11 +265,13 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
             let status_u16 = status.as_u16();
             let is_success = status.is_success();
             tokio::spawn(async move {
-                let mut parser = if streaming {
-                    StreamUsageParser::sse()
-                } else {
-                    StreamUsageParser::json()
-                };
+                // The parser is independent of the upstream Content-Type: the
+                // Codex Responses client feeds the same byte stream to its own
+                // SSE parser, and real responses can be SSE-framed even under a
+                // JSON Content-Type (issue #20). A body that never frames as
+                // SSE is extracted as complete JSON from the same bounded
+                // buffer (see `usage::StreamUsageParser`).
+                let mut parser = StreamUsageParser::sse();
                 let mut outcome = Outcome::Completed;
                 let mut stream = upstream.bytes_stream();
                 // The response body is wrapped in `DropNotifyStream`, so this
@@ -393,17 +394,6 @@ fn record_audit(
         record.metering_error = None;
     }
     audit.try_record(record);
-}
-
-/// The bypass extractor selects its parsing mode based on the response
-/// Content-Type (DESIGN.md §2): `text/event-stream` uses the incremental SSE
-/// parser, everything else the bounded JSON parser.
-fn is_event_stream(headers: &[(HeaderName, header::HeaderValue)]) -> bool {
-    headers
-        .iter()
-        .find(|(name, _)| name == header::CONTENT_TYPE)
-        .and_then(|(_, value)| value.to_str().ok())
-        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
 }
 
 /// Fires `notify` once when the wrapped stream is dropped — i.e. when the
