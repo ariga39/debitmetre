@@ -31,6 +31,13 @@ const TEST_METER_KEY_DIGEST: &str =
 /// accounting_quality is `complete`.
 const STREAMING_RESPONSE_FIXTURE: &str = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-synthetic-01\",\"model\":\"synthetic-model-001\",\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":4,\"cache_write_tokens\":2},\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":2},\"total_tokens\":17}}}\n\n";
 
+/// A synthetic nonterminal SSE event (DESIGN.md §4.1): `response.output_text.delta`
+/// is forwarded unchanged and is not a terminal event, so a stream reaching clean
+/// EOF with only this event never observed `response.completed` or
+/// `response.incomplete`.
+const NONTERMINAL_SSE_FIXTURE: &str =
+    "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"synthetic-delta-01\"}\n\n";
+
 /// Parse the current JSONL usage-file content into records (audit seam).
 fn read_jsonl(path: &std::path::Path) -> Vec<serde_json::Value> {
     std::fs::read_to_string(path)
@@ -451,6 +458,81 @@ async fn successful_json_responses_body_with_incomplete_status_is_forwarded_and_
     assert_eq!(usage["output_total"], 5);
     assert_eq!(usage["reasoning"], 2);
     assert_eq!(usage["total"], 17);
+}
+
+#[tokio::test]
+async fn successful_stream_with_only_nonterminal_event_records_upstream_interrupted() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![
+            ("content-type".to_string(), "text/event-stream".to_string()),
+            (
+                "x-codex-semantic".to_string(),
+                "nonterminal-semantic-01".to_string(),
+            ),
+        ],
+        body: NONTERMINAL_SSE_FIXTURE.as_bytes().to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-semantic")
+            .and_then(|v| v.to_str().ok()),
+        Some("nonterminal-semantic-01"),
+        "caller-visible upstream headers preserved"
+    );
+    assert_eq!(
+        response
+            .bytes()
+            .await
+            .expect("gateway response body")
+            .as_ref(),
+        NONTERMINAL_SSE_FIXTURE.as_bytes(),
+        "caller-visible response bytes are byte-for-byte the upstream SSE"
+    );
+
+    let record = wait_for_jsonl_record(&usage_file).await;
+    assert_eq!(
+        read_jsonl(&usage_file).len(),
+        1,
+        "exactly one audit record per accepted request"
+    );
+    assert_eq!(record["kind"], "request");
+    assert_eq!(record["operation"], "response");
+    assert_eq!(record["machine_id"], "machine-a");
+    assert_eq!(record["upstream_status"], 200);
+    assert_eq!(record["outcome"], "upstream_interrupted");
+    assert_eq!(record["model"], serde_json::Value::Null);
+    assert_eq!(record["accounting_quality"], "unavailable");
+    assert!(record["usage"].is_null());
 }
 
 fn raw_request_head(extra_header_bytes: &[u8]) -> Vec<u8> {

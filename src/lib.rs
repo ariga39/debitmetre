@@ -332,6 +332,10 @@ fn record_audit(
         Outcome::UpstreamError
     } else if outcome == Outcome::Completed && parser.incomplete() {
         Outcome::Incomplete
+    } else if outcome == Outcome::Completed && !parser.terminal_seen() {
+        // A successful stream that ended without observing a terminal event
+        // never reached a completed lifecycle (DESIGN.md §4.1, §5).
+        Outcome::UpstreamInterrupted
     } else {
         outcome
     };

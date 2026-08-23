@@ -198,6 +198,16 @@ impl StreamUsageParser {
             StreamUsageParser::Json(p) => p.incomplete(),
         }
     }
+
+    /// Whether the parser observed a terminal event: for SSE, a
+    /// `response.completed` or `response.incomplete` event (DESIGN.md §4.1); a
+    /// non-streaming body is inherently terminal once fully received.
+    pub(crate) fn terminal_seen(&self) -> bool {
+        match self {
+            StreamUsageParser::Sse(p) => p.terminal_seen(),
+            StreamUsageParser::Json(_) => true,
+        }
+    }
 }
 
 /// Bounded incremental SSE parser: extracts usage and model from the terminal
@@ -215,6 +225,7 @@ pub(crate) struct SseUsageParser {
     discarding: bool,
     oversized: bool,
     terminal_incomplete: bool,
+    terminal_seen: bool,
     usage_malformed: bool,
     model: Option<String>,
     usage: Option<(Usage, AccountingQuality)>,
@@ -230,6 +241,7 @@ impl SseUsageParser {
             discarding: false,
             oversized: false,
             terminal_incomplete: false,
+            terminal_seen: false,
             usage_malformed: false,
             model: None,
             usage: None,
@@ -285,6 +297,7 @@ impl SseUsageParser {
         if !matches!(kind, Some("response.completed" | "response.incomplete")) {
             return;
         }
+        self.terminal_seen = true;
         if kind == Some("response.incomplete") {
             self.terminal_incomplete = true;
         }
@@ -305,6 +318,10 @@ impl SseUsageParser {
 
     fn incomplete(&self) -> bool {
         self.terminal_incomplete
+    }
+
+    fn terminal_seen(&self) -> bool {
+        self.terminal_seen
     }
 
     fn finish(&self) -> AuditResult {
