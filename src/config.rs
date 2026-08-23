@@ -83,14 +83,14 @@ impl Config {
         let mut machine_keys = BTreeMap::new();
         for (digest, machine_id) in raw.machine_keys {
             if !is_digest_hex(&digest) {
-                return Err(validation(format!(
-                    "machine_keys entry {digest:?} must be a 64-character lowercase hex SHA-256 digest"
-                )));
+                // The digest value itself is configuration content and is never
+                // echoed: the reason names the field and the exact rule only.
+                return Err(validation(
+                    "machine_keys entry must be a 64-character lowercase hex SHA-256 digest".into(),
+                ));
             }
             if machine_id.trim().is_empty() {
-                return Err(validation(format!(
-                    "machine id for digest {digest} must not be blank"
-                )));
+                return Err(validation("machine id must not be blank".into()));
             }
             machine_keys.insert(digest, machine_id);
         }
@@ -133,7 +133,15 @@ impl fmt::Display for ConfigError {
                 write!(f, "cannot read config {}: {}", path.display(), source)
             }
             ErrorKind::Parse { path, source } => {
-                write!(f, "invalid TOML in {}: {}", path.display(), source)
+                // Only the parse message is shown, never the raw TOML source
+                // snippet: the snippet is configuration content, the message is
+                // an understandable reason.
+                write!(
+                    f,
+                    "invalid TOML in {}: {}",
+                    path.display(),
+                    source.message()
+                )
             }
             ErrorKind::Validation { path, message } => {
                 write!(f, "invalid config in {}: {message}", path.display())

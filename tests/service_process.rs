@@ -27,6 +27,10 @@ const TEST_METER_KEY: &str = "test-meter-key-machine-a";
 const REQUEST_BODY: &str = "opaque-request-body-42";
 const UPSTREAM_BODY: &str = "opaque-upstream-body-01";
 
+/// A unique value embedded only in synthetic configuration content for the
+/// privacy assertion: the configuration_error reason must never echo it.
+const PRIVATE_CONFIG_MARKER: &str = "PRIVATE-MARKER-Q7x2k9";
+
 async fn fake_upstream_handler(_req: Request<Body>) -> Response {
     (StatusCode::CREATED, UPSTREAM_BODY).into_response()
 }
@@ -374,10 +378,18 @@ async fn normal_and_non_2xx_upstream_responses_emit_distinct_structured_events()
         "upstream HTTP failure is a warn event, got: {error_line}"
     );
     assert!(
+        info_line.contains("event=\"upstream_response\""),
+        "normal event carries the stable machine-readable event field, got: {info_line}"
+    );
+    assert!(
         info_line.contains("route=\"responses\"")
             && info_line.contains("machine_id=\"machine-a\"")
             && info_line.contains("status=201"),
         "normal event carries route/machine/status context, got: {info_line}"
+    );
+    assert!(
+        error_line.contains("event=\"upstream_http_error\""),
+        "upstream HTTP failure carries the stable machine-readable event field, got: {error_line}"
     );
     assert!(
         error_line.contains("route=\"responses/compact\"")
@@ -444,6 +456,10 @@ async fn upstream_transport_failure_emits_distinct_error_event_with_safe_502() {
     assert!(
         error_line.contains("ERROR"),
         "upstream transport failure is an ERROR event, got: {error_line}"
+    );
+    assert!(
+        error_line.contains("event=\"upstream_transport_error\""),
+        "transport failure carries the stable machine-readable event field, got: {error_line}"
     );
     assert!(
         error_line.contains("route=\"responses\"")
@@ -662,6 +678,10 @@ fn configuration_failure_emits_distinct_error_event_on_stderr() {
         "configuration failure is an ERROR event, got: {error_line}"
     );
     assert!(
+        error_line.contains("event=\"configuration_error\""),
+        "configuration failure carries the stable machine-readable event field, got: {error_line}"
+    );
+    assert!(
         error_line.contains("cannot read config"),
         "the event carries a useful sanitized reason, got: {error_line}"
     );
@@ -676,6 +696,59 @@ fn configuration_failure_emits_distinct_error_event_on_stderr() {
             && !stderr.contains("authorization")
             && !stderr.contains("Bearer"),
         "no config contents, meter key digest, Authorization, or environment values are logged"
+    );
+}
+
+#[test]
+fn configuration_error_log_gives_understandable_reason_without_echoing_config_contents() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+
+    // Validation failure: the invalid digest value itself is config content and
+    // must never be echoed by the configuration_error reason.
+    let bad_digest = dir.path().join("bad-digest.toml");
+    std::fs::write(
+        &bad_digest,
+        format!(
+            "listen = \"127.0.0.1:8787\"\nusage_file = \"/tmp/usage.jsonl\"\n\n[machine_keys]\n\"{PRIVATE_CONFIG_MARKER}\" = \"machine-a\"\n"
+        ),
+    )
+    .expect("write invalid-digest config");
+    let (status, _stdout, stderr) = run_binary(&["--config", bad_digest.to_str().unwrap()]);
+    assert!(!status.success(), "invalid digest must fail closed");
+    let validation_line = stderr
+        .lines()
+        .find(|line| line.contains("configuration error"))
+        .unwrap_or_else(|| panic!("configuration-failure event missing; stderr:\n{stderr}"));
+    assert!(
+        validation_line.contains("machine_keys"),
+        "understandable validation reason, got: {validation_line}"
+    );
+    assert!(
+        !stderr.contains(PRIVATE_CONFIG_MARKER),
+        "validation reason must not echo the invalid digest value"
+    );
+
+    // Parse failure: the offending TOML source line is config content and must
+    // never be echoed by the configuration_error reason.
+    let malformed = dir.path().join("malformed.toml");
+    std::fs::write(
+        &malformed,
+        format!("usage_file = \"{PRIVATE_CONFIG_MARKER}\n"),
+    )
+    .expect("write malformed config carrying the marker on the offending line");
+    let (status, _stdout, stderr) = run_binary(&["--config", malformed.to_str().unwrap()]);
+    assert!(!status.success(), "malformed config must fail closed");
+    let parse_line = stderr
+        .lines()
+        .find(|line| line.contains("configuration error"))
+        .unwrap_or_else(|| panic!("configuration-failure event missing; stderr:\n{stderr}"));
+    assert!(
+        parse_line.contains("invalid TOML"),
+        "understandable parse reason, got: {parse_line}"
+    );
+    assert!(
+        !stderr.contains(PRIVATE_CONFIG_MARKER),
+        "parse reason must not echo TOML source snippets"
     );
 }
 

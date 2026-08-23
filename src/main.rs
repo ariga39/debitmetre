@@ -168,7 +168,11 @@ async fn run_gateway(config_path: PathBuf) -> ExitCode {
     let cfg = match config::load(&config_path) {
         Ok(cfg) => cfg,
         Err(err) => {
-            tracing::error!(reason = %err, "configuration error");
+            tracing::error!(
+                event = "configuration_error",
+                reason = %err,
+                "configuration error"
+            );
             return ExitCode::FAILURE;
         }
     };
@@ -176,7 +180,11 @@ async fn run_gateway(config_path: PathBuf) -> ExitCode {
     let app = match build_gateway(&cfg) {
         Ok(gateway) => gateway.router(),
         Err(err) => {
-            tracing::error!(reason = %err, "configuration error");
+            tracing::error!(
+                event = "configuration_error",
+                reason = %err,
+                "configuration error"
+            );
             return ExitCode::FAILURE;
         }
     };

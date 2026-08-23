@@ -233,6 +233,7 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
             let machine_id = machine_id.to_string();
             if status.is_success() {
                 tracing::info!(
+                    event = "upstream_response",
                     route = endpoint_suffix,
                     machine_id = machine_id.as_str(),
                     status = status.as_u16(),
@@ -240,6 +241,7 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
                 );
             } else {
                 tracing::warn!(
+                    event = "upstream_http_error",
                     route = endpoint_suffix,
                     machine_id = machine_id.as_str(),
                     status = status.as_u16(),
@@ -332,6 +334,7 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
             record.outcome = Outcome::TransportError;
             gateway.audit.try_record(record);
             tracing::error!(
+                event = "upstream_transport_error",
                 route = endpoint_suffix,
                 machine_id = machine_id.as_str(),
                 "upstream transport error"
