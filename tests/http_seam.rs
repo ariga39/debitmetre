@@ -477,6 +477,251 @@ async fn genuine_json_with_blank_line_whitespace_is_forwarded_and_records_known_
     assert_eq!(usage["total"], 17);
 }
 
+/// Build a synthetic Responses JSON body whose `output` text carries a padding
+/// string, used to make the body exceed the bounded observers' caps while the
+/// token facts stay at known synthetic values.
+fn padded_json_body(pad_bytes: usize, id: &str) -> String {
+    let pad = "x".repeat(pad_bytes);
+    format!(
+        "{{\"id\":\"{id}\",\"model\":\"synthetic-model-001\",\"output\":[{{\"type\":\"output_text\",\"text\":\"{pad}\"}}],\"usage\":{{\"input_tokens\":12,\"output_tokens\":5,\"total_tokens\":17}}}}"
+    )
+}
+
+/// A complete non-streaming JSON body larger than the bounded JSON observer cap
+/// (DESIGN.md §4, issue #20 PR review): the response reaches a clean EOF and is
+/// metered as `completed`, not `upstream_interrupted`, even though the bounded
+/// observer cannot parse it. The caller-visible bytes stay unchanged.
+#[tokio::test]
+async fn large_genuine_json_body_is_completed_with_missing_usage() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    let body = padded_json_body(80 * 1024, "resp-large-json");
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                "x-codex-semantic".to_string(),
+                "large-json-semantic-01".to_string(),
+            ),
+        ],
+        body: body.as_bytes().to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-semantic")
+            .and_then(|v| v.to_str().ok()),
+        Some("large-json-semantic-01"),
+        "caller-visible upstream headers preserved"
+    );
+    assert_eq!(
+        response
+            .bytes()
+            .await
+            .expect("gateway response body")
+            .as_ref(),
+        body.as_bytes(),
+        "caller-visible response bytes are byte-for-byte the upstream JSON body"
+    );
+
+    let record = wait_for_jsonl_record(&usage_file).await;
+    assert_eq!(record["kind"], "request");
+    assert_eq!(record["operation"], "response");
+    assert_eq!(record["upstream_status"], 200);
+    assert_eq!(
+        record["outcome"], "completed",
+        "a fully received non-streaming body is completed, never upstream_interrupted \
+         just because the bounded observer could not parse it"
+    );
+    assert!(record["usage"].is_null());
+    assert_eq!(record["accounting_quality"], "unavailable");
+    assert_eq!(record["metering_error"], "missing_usage");
+}
+
+/// A complete malformed non-streaming JSON body (issue #20 PR review): clean EOF
+/// with an honest metering parse failure records `completed`, not
+/// `upstream_interrupted`. The caller-visible bytes stay unchanged.
+#[tokio::test]
+async fn malformed_json_body_is_completed_with_missing_usage() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    let body = "{\"id\":\"resp-malformed\",\"usage\":{\"input_tokens\":12,";
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                "x-codex-semantic".to_string(),
+                "malformed-json-semantic-01".to_string(),
+            ),
+        ],
+        body: body.as_bytes().to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-semantic")
+            .and_then(|v| v.to_str().ok()),
+        Some("malformed-json-semantic-01"),
+        "caller-visible upstream headers preserved"
+    );
+    assert_eq!(
+        response
+            .bytes()
+            .await
+            .expect("gateway response body")
+            .as_ref(),
+        body.as_bytes(),
+        "caller-visible response bytes are byte-for-byte the upstream body"
+    );
+
+    let record = wait_for_jsonl_record(&usage_file).await;
+    assert_eq!(record["kind"], "request");
+    assert_eq!(record["operation"], "response");
+    assert_eq!(record["upstream_status"], 200);
+    assert_eq!(
+        record["outcome"], "completed",
+        "a malformed non-streaming body that reached clean EOF is completed, \
+         not upstream_interrupted"
+    );
+    assert!(record["usage"].is_null());
+    assert_eq!(record["accounting_quality"], "unavailable");
+    assert_eq!(record["metering_error"], "missing_usage");
+}
+
+/// A terminal SSE event larger than the bounded SSE observer cap (DESIGN.md
+/// §4.1, issue #20 PR review): the terminal outcome (`completed`) is preserved,
+/// and the request records `metering_error=event_too_large`, never
+/// `upstream_interrupted`. The caller-visible bytes stay unchanged.
+#[tokio::test]
+async fn oversized_terminal_sse_event_is_completed_with_event_too_large() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    let pad = "x".repeat(256 * 1024);
+    let body = format!(
+        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-oversized\",\"output\":[{{\"type\":\"output_text\",\"text\":\"{pad}\"}}],\"usage\":{{\"input_tokens\":12,\"output_tokens\":5,\"total_tokens\":17}}}}}}\n\n"
+    );
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![
+            ("content-type".to_string(), "text/event-stream".to_string()),
+            (
+                "x-codex-semantic".to_string(),
+                "oversized-terminal-semantic-01".to_string(),
+            ),
+        ],
+        body: body.as_bytes().to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-semantic")
+            .and_then(|v| v.to_str().ok()),
+        Some("oversized-terminal-semantic-01"),
+        "caller-visible upstream headers preserved"
+    );
+    assert_eq!(
+        response
+            .bytes()
+            .await
+            .expect("gateway response body")
+            .as_ref(),
+        body.as_bytes(),
+        "caller-visible response bytes are byte-for-byte the upstream SSE body"
+    );
+
+    let record = wait_for_jsonl_record(&usage_file).await;
+    assert_eq!(record["kind"], "request");
+    assert_eq!(record["operation"], "response");
+    assert_eq!(record["upstream_status"], 200);
+    assert_eq!(
+        record["outcome"], "completed",
+        "an oversized terminal event keeps its supported terminal outcome"
+    );
+    assert!(record["usage"].is_null());
+    assert_eq!(record["accounting_quality"], "unavailable");
+    assert_eq!(record["metering_error"], "event_too_large");
+}
+
 /// A synthetic non-streaming compact response (DESIGN.md §11: the real compact
 /// response shape is pending PoC, so this uses a conservative JSON body) with
 /// only `input_total` and `output_total` present: the absent counters must stay

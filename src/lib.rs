@@ -271,7 +271,7 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
                 // JSON Content-Type (issue #20). A body that never frames as
                 // SSE is extracted as complete JSON from the same bounded
                 // buffer (see `usage::StreamUsageParser`).
-                let mut parser = StreamUsageParser::sse();
+                let mut parser = StreamUsageParser::new();
                 let mut outcome = Outcome::Completed;
                 let mut stream = upstream.bytes_stream();
                 // The response body is wrapped in `DropNotifyStream`, so this

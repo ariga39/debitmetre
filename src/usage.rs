@@ -169,16 +169,20 @@ pub(crate) struct AuditResult {
 /// (pinned codex-cli 0.149.0, `codex-rs/codex-api/src/sse/responses.rs`), so a
 /// JSON-labeled body can still be SSE-framed. A body is metered as SSE only when
 /// a terminal `response.completed` / `response.incomplete` event is actually
-/// observed; otherwise the complete non-streaming JSON body owns the result.
-/// Both observers are bounded ([`SSE_EVENT_CAP`] per SSE event,
-/// [`JSON_USAGE_CAP`] per JSON body); the whole body is never accumulated.
+/// observed (including one recognized from its bounded prefix when oversized);
+/// otherwise the complete non-streaming JSON body owns the result. The lifecycle
+/// is terminal when the SSE observer saw a supported terminal event or the body
+/// never framed as SSE and reached clean EOF — a completed non-streaming body
+/// whose bounded metering parse failed stays `completed`, never
+/// `upstream_interrupted`. Both observers are bounded ([`SSE_EVENT_CAP`] per SSE
+/// event, [`JSON_USAGE_CAP`] per JSON body); the whole body is never accumulated.
 pub(crate) struct StreamUsageParser {
     sse: SseUsageParser,
     json: JsonUsageParser,
 }
 
 impl StreamUsageParser {
-    pub(crate) fn sse() -> Self {
+    pub(crate) fn new() -> Self {
         StreamUsageParser {
             sse: SseUsageParser::new(SSE_EVENT_CAP),
             json: JsonUsageParser::new(JSON_USAGE_CAP),
@@ -191,10 +195,11 @@ impl StreamUsageParser {
     }
 
     /// Finalize parsing after the stream reaches its terminal state: the SSE
-    /// observer owns the result when it observed a terminal event; otherwise
-    /// the non-streaming JSON body owns it.
+    /// observer owns the result when it observed a supported terminal event
+    /// (including an oversized one recognized from its bounded prefix);
+    /// otherwise the non-streaming JSON body owns it.
     pub(crate) fn finish(&self) -> AuditResult {
-        if self.sse.terminal_seen() {
+        if self.sse.terminal_seen() || self.sse.oversized_terminal_seen() {
             self.sse.finish()
         } else {
             self.json.finish()
@@ -204,18 +209,19 @@ impl StreamUsageParser {
     /// Whether the stream carried a terminal `response.incomplete` event (SSE)
     /// or the non-streaming JSON body carries the top-level `incomplete` marker.
     pub(crate) fn incomplete(&self) -> bool {
-        if self.sse.terminal_seen() {
+        if self.sse.terminal_seen() || self.sse.oversized_terminal_seen() {
             self.sse.incomplete()
         } else {
             self.json.incomplete()
         }
     }
 
-    /// Whether the parser observed a grounded terminal state: a
-    /// `response.completed` / `response.incomplete` SSE event (DESIGN.md §4.1)
-    /// or a complete non-streaming JSON body within the cap.
+    /// Whether the parser observed a grounded terminal state: a supported
+    /// terminal SSE event (DESIGN.md §4.1), or a body that never framed as SSE
+    /// and reached clean EOF (a completed non-streaming body, regardless of
+    /// whether its bounded metering parse succeeded).
     pub(crate) fn terminal_seen(&self) -> bool {
-        self.sse.terminal_seen() || self.json.terminal_seen()
+        self.sse.terminal_seen() || self.sse.oversized_terminal_seen() || !self.sse.saw_event()
     }
 }
 
@@ -236,6 +242,15 @@ pub(crate) struct SseUsageParser {
     terminal_incomplete: bool,
     terminal_seen: bool,
     usage_malformed: bool,
+    /// Whether at least one SSE data event was actually observed (a real SSE
+    /// stream), as opposed to a body that never framed as SSE.
+    saw_event: bool,
+    /// Whether an oversized (discarded) event's bounded prefix carried the
+    /// `response.completed` terminal name.
+    oversized_terminal_completed: bool,
+    /// Whether an oversized (discarded) event's bounded prefix carried the
+    /// `response.incomplete` terminal name.
+    oversized_terminal_incomplete: bool,
     model: Option<String>,
     usage: Option<(Usage, AccountingQuality)>,
 }
@@ -252,6 +267,9 @@ impl SseUsageParser {
             terminal_incomplete: false,
             terminal_seen: false,
             usage_malformed: false,
+            saw_event: false,
+            oversized_terminal_completed: false,
+            oversized_terminal_incomplete: false,
             model: None,
             usage: None,
         }
@@ -271,6 +289,20 @@ impl SseUsageParser {
                 let event = std::mem::take(&mut self.event_buf);
                 if !self.discarding {
                     self.consume_event(&event);
+                } else {
+                    // Bounded terminal-name observation of an oversized event:
+                    // the prefix already buffered within `event_cap` is scanned
+                    // for the supported terminal names, so an oversized terminal
+                    // event keeps its terminal outcome (DESIGN.md §4.1).
+                    if prefix_has_sse_framing(&event) {
+                        self.saw_event = true;
+                    }
+                    if prefix_has_terminal(&event, b"response.completed") {
+                        self.oversized_terminal_completed = true;
+                    }
+                    if prefix_has_terminal(&event, b"response.incomplete") {
+                        self.oversized_terminal_incomplete = true;
+                    }
                 }
                 self.discarding = false;
                 self.tail_len = 0;
@@ -295,6 +327,7 @@ impl SseUsageParser {
         if data.is_empty() {
             return;
         }
+        self.saw_event = true;
         let payload = data.join("\n");
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
             return;
@@ -326,11 +359,35 @@ impl SseUsageParser {
     }
 
     fn incomplete(&self) -> bool {
-        self.terminal_incomplete
+        self.terminal_incomplete || self.oversized_terminal_incomplete()
     }
 
     fn terminal_seen(&self) -> bool {
         self.terminal_seen
+    }
+
+    /// Whether an oversized (discarded) event was a supported terminal event,
+    /// recognized from its bounded prefix. Bounded: scans at most `event_cap`
+    /// bytes, never re-buffering a whole event.
+    fn oversized_terminal_seen(&self) -> bool {
+        self.oversized_terminal_completed
+            || self.oversized_terminal_incomplete
+            || (self.discarding
+                && (prefix_has_terminal(&self.event_buf, b"response.completed")
+                    || prefix_has_terminal(&self.event_buf, b"response.incomplete")))
+    }
+
+    fn oversized_terminal_incomplete(&self) -> bool {
+        self.oversized_terminal_incomplete
+            || (self.discarding && prefix_has_terminal(&self.event_buf, b"response.incomplete"))
+    }
+
+    /// Whether the body framed as an SSE stream: at least one SSE data event was
+    /// consumed, or an oversized (discarded) event's bounded prefix carries SSE
+    /// field lines. A body that never frames as SSE (a non-streaming JSON body)
+    /// reports false.
+    fn saw_event(&self) -> bool {
+        self.saw_event || (self.discarding && prefix_has_sse_framing(&self.event_buf))
     }
 
     fn finish(&self) -> AuditResult {
@@ -343,12 +400,37 @@ impl SseUsageParser {
                 .unwrap_or(AccountingQuality::Unavailable),
             metering_error: match &self.usage {
                 Some(_) => None,
-                None if self.oversized => Some(MeteringError::EventTooLarge),
+                // `event_too_large` is reserved for a terminal event exceeding
+                // the bounded parse limit (DESIGN.md §4.1); an oversized
+                // non-terminal event that never produced a terminal is simply
+                // missing usage.
+                None if self.oversized_terminal_seen() => Some(MeteringError::EventTooLarge),
+                None if self.oversized => Some(MeteringError::MissingUsage),
                 None if self.usage_malformed => Some(MeteringError::MalformedUsage),
                 None => Some(MeteringError::MissingUsage),
             },
         }
     }
+}
+
+/// Whether `bytes` (a bounded SSE-event prefix) starts a line with an SSE field
+/// name (`event:`, `data:`, `id:`, `retry:`). A non-streaming JSON body never
+/// contains such lines, so this distinguishes a discarded oversized SSE event
+/// from a huge JSON body.
+fn prefix_has_sse_framing(bytes: &[u8]) -> bool {
+    bytes.split(|&b| b == b'\n').any(|line| {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        line.starts_with(b"event:")
+            || line.starts_with(b"data:")
+            || line.starts_with(b"id:")
+            || line.starts_with(b"retry:")
+    })
+}
+
+/// Whether `bytes` contains the fixed `name` byte substring. Used to recognize a
+/// supported terminal SSE event name in a bounded prefix.
+fn prefix_has_terminal(bytes: &[u8], name: &[u8]) -> bool {
+    bytes.windows(name.len()).any(|window| window == name)
 }
 
 /// Bounded side-band observer for a non-streaming (`application/json`) response
@@ -403,16 +485,6 @@ impl JsonUsageParser {
                 })
             })
             .unwrap_or(false)
-    }
-
-    /// Whether the observer captured a complete non-streaming JSON body within
-    /// the cap: such a body is inherently terminal once fully received. A body
-    /// that overflowed the cap or is not complete JSON is not terminal.
-    fn terminal_seen(&self) -> bool {
-        if self.overflowed {
-            return false;
-        }
-        serde_json::from_slice::<serde_json::Value>(&self.buf).is_ok()
     }
 
     fn finish(&self) -> AuditResult {

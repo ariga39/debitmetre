@@ -88,6 +88,12 @@ Request headers follow an explicit stripping policy that prioritizes compatibili
   that request's audit records `usage=null`, `accounting_quality=unavailable`, and
   `metering_error=event_too_large`. The limit value is chosen after PoC observation
   and is an implementation parameter, not a product promise.
+- Implementation note (parser reuse): the bounded SSE observer does not adopt `eventsource-stream` 0.2.3
+  (the crate used by the pinned Codex client). That crate has no per-event size cap, and observing through
+  a transparent tee would require either blocking, dropping, or unbounded buffering of the side channel,
+  plus separate cancellation coordination between the response pump and the observer. The pinned
+  orihsus bounded SSE parser (`src/gateway.rs`) is adapted instead, with a tiny bounded terminal-name
+  observation of an oversized event's prefix so an oversized terminal event keeps its terminal outcome.
 
 ## 5. Audit (canonical request audit)
 
