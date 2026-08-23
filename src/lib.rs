@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::body::{Body, Bytes};
@@ -8,7 +9,7 @@ use axum::http::{header, HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
 
 pub mod config;
@@ -248,6 +249,8 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
             let streaming = is_event_stream(&filtered_headers);
             let (tx, rx) =
                 tokio::sync::mpsc::channel::<Result<Bytes, std::convert::Infallible>>(16);
+            let client_gone = Arc::new(tokio::sync::Notify::new());
+            let task_gone = Arc::clone(&client_gone);
             let audit = Arc::clone(&gateway.audit);
             let status_u16 = status.as_u16();
             let is_success = status.is_success();
@@ -259,23 +262,38 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
                 };
                 let mut outcome = Outcome::Completed;
                 let mut stream = upstream.bytes_stream();
-                loop {
-                    match stream.next().await {
-                        Some(Ok(bytes)) => {
-                            parser.push(&bytes);
-                            if tx.send(Ok(bytes)).await.is_err() {
-                                // Caller dropped the response body: stop pumping
-                                // upstream (DESIGN.md §5 client_cancelled).
-                                outcome = Outcome::ClientCancelled;
-                                break;
+                // The response body is wrapped in `DropNotifyStream`, so this
+                // notification fires once the caller abandons the response body
+                // — even when the upstream is silent (DESIGN.md §5
+                // client_cancelled). Racing the pump against it stops upstream
+                // pumping immediately on caller disconnect instead of waiting
+                // for the next upstream chunk.
+                let pump = async {
+                    loop {
+                        match stream.next().await {
+                            Some(Ok(bytes)) => {
+                                parser.push(&bytes);
+                                if tx.send(Ok(bytes)).await.is_err() {
+                                    // Caller dropped the response body: stop
+                                    // pumping upstream (DESIGN.md §5
+                                    // client_cancelled).
+                                    return false;
+                                }
                             }
+                            Some(Err(_)) => {
+                                outcome = Outcome::UpstreamInterrupted;
+                                return true;
+                            }
+                            None => return true,
                         }
-                        Some(Err(_)) => {
-                            outcome = Outcome::UpstreamInterrupted;
-                            break;
-                        }
-                        None => break,
                     }
+                };
+                let completed = tokio::select! {
+                    _ = task_gone.notified() => false,
+                    done = pump => done,
+                };
+                if !completed {
+                    outcome = Outcome::ClientCancelled;
                 }
                 record_audit(
                     &audit,
@@ -293,9 +311,10 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
                 response = response.header(name, value);
             }
             response
-                .body(axum::body::Body::from_stream(
+                .body(axum::body::Body::from_stream(DropNotifyStream::new(
                     tokio_stream::wrappers::ReceiverStream::new(rx),
-                ))
+                    client_gone,
+                )))
                 .unwrap_or_else(|_| unauthorized())
         }
         Err(_) => {
@@ -373,4 +392,47 @@ fn is_event_stream(headers: &[(HeaderName, header::HeaderValue)]) -> bool {
         .find(|(name, _)| name == header::CONTENT_TYPE)
         .and_then(|(_, value)| value.to_str().ok())
         .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+}
+
+/// Fires `notify` once when the wrapped stream is dropped — i.e. when the
+/// caller abandons the response body, even while the upstream is silent. The
+/// response pump races this notification against the upstream stream so that
+/// caller disconnect stops upstream pumping without waiting for another body
+/// chunk (DESIGN.md §5 client_cancelled).
+///
+/// Adapted from `src/gateway.rs` in [ariga39/orihsus] (MIT OR Apache-2.0,
+/// Copyright (c) 2026 Kagami) at revision
+/// `7285dd5c6a7ec5f1c0e521c6ee71f70e659d6220`; see THIRD-PARTY-NOTICES.md.
+///
+/// [ariga39/orihsus]: https://github.com/ariga39/orihsus
+struct DropNotifyStream<S> {
+    inner: S,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl<S> DropNotifyStream<S> {
+    fn new(inner: S, notify: Arc<tokio::sync::Notify>) -> Self {
+        DropNotifyStream { inner, notify }
+    }
+}
+
+impl<S> Drop for DropNotifyStream<S> {
+    fn drop(&mut self) {
+        self.notify.notify_one();
+    }
+}
+
+impl<S: Stream + Unpin> Stream for DropNotifyStream<S> {
+    type Item = S::Item;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<S::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
 }

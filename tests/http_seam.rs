@@ -1602,6 +1602,141 @@ X-Meter-Key: test-meter-key-machine-a\r\n\
     }
 }
 
+/// A raw-TCP fake upstream that reads the full request head, answers with a
+/// successful `text/event-stream` response head, and then stays quiet forever.
+/// It passively observes the gateway's upstream connection and flips `dropped`
+/// only when that connection closes — never because the request body ended, so
+/// it cannot be fooled by request completion.
+async fn spawn_quiet_tcp_upstream(dropped: Arc<Mutex<bool>>) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind quiet upstream listener");
+    let addr = listener.local_addr().expect("resolved address");
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => return,
+            };
+            let dropped = dropped.clone();
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stream.read(&mut chunk).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\n\
+                        Content-Type: text/event-stream\r\n\
+                        Transfer-Encoding: chunked\r\n\
+                        \r\n",
+                    )
+                    .await
+                    .expect("write quiet upstream response head");
+                let mut byte = [0u8; 1];
+                loop {
+                    match stream.read(&mut byte).await {
+                        Ok(0) | Err(_) => {
+                            *dropped.lock().unwrap() = true;
+                            return;
+                        }
+                        Ok(_) => {}
+                    }
+                }
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn caller_disconnect_after_response_head_records_client_cancelled_with_quiet_upstream() {
+    let dropped = Arc::new(Mutex::new(false));
+    let upstream_url = spawn_quiet_tcp_upstream(dropped.clone()).await;
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+    let gateway_addr: SocketAddr = gateway_url
+        .trim_start_matches("http://")
+        .parse()
+        .expect("gateway socket addr");
+
+    let mut stream = TcpStream::connect(gateway_addr)
+        .await
+        .expect("connect to gateway");
+    stream
+        .write_all(
+            b"POST /v1/responses HTTP/1.1\r\n\
+            Host: gateway\r\n\
+            Content-Length: 8\r\n\
+            X-Meter-Key: test-meter-key-machine-a\r\n\
+            \r\n\
+            opaque-1",
+        )
+        .await
+        .expect("write complete request");
+
+    let mut raw = Vec::new();
+    read_raw_until(&mut stream, &mut raw, b"\r\n\r\n").await;
+    assert!(
+        String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 200"),
+        "caller receives the upstream response head"
+    );
+
+    drop(stream);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if *dropped.lock().unwrap() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "quiet upstream did not observe connection closure after caller disconnect \
+                 without another upstream body chunk"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let record = wait_for_jsonl_record(&usage_file).await;
+    assert_eq!(
+        read_jsonl(&usage_file).len(),
+        1,
+        "exactly one audit record per accepted request"
+    );
+    assert_eq!(record["kind"], "request");
+    assert_eq!(record["operation"], "response");
+    assert_eq!(record["machine_id"], "machine-a");
+    assert_eq!(record["upstream_status"], 200);
+    assert_eq!(
+        record["outcome"], "client_cancelled",
+        "caller disconnect must classify as client_cancelled, never upstream_interrupted"
+    );
+    assert_eq!(record["accounting_quality"], "unavailable");
+    assert!(
+        record["usage"].is_null(),
+        "no terminal usage was received, so usage must stay null without guessed counters"
+    );
+}
+
 #[tokio::test]
 async fn prefixed_upstream_base_preserves_codex_prefix_on_both_routes() {
     let upstream = FakeUpstream::default();

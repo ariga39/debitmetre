@@ -10,6 +10,9 @@ at the pinned revision `7285dd5c6a7ec5f1c0e521c6ee71f70e659d6220`:
   `src/gateway.rs` (lines around 2261, 2294, and 2336 respectively).
 - The bounded single-writer JSONL audit writer is adapted from `src/audit.rs`
   (lines around 291, 504, and 527 respectively).
+- `DropNotifyStream` and its response-pump select pattern (client-cancel
+  detection without another upstream chunk) are adapted from `src/gateway.rs`
+  (lines around 2413 and 1966–1995 respectively).
 
 orihsus's key-pool/retry/quota/product semantics are not imported; only the
 stream pump, SSE/JSON usage parsing, and audit writer building blocks are used,
