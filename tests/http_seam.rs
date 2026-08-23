@@ -1248,3 +1248,38 @@ async fn prefixed_upstream_base_preserves_codex_prefix_on_both_routes() {
         assert_eq!(captured[1].body, b"opaque-compact-body-07");
     }
 }
+
+#[tokio::test]
+async fn healthz_returns_200_without_authentication_and_rejects_other_methods() {
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse("http://127.0.0.1:9").expect("unused upstream url"),
+        machine_keys,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .get(format!("{gateway_url}/healthz"))
+        .send()
+        .await
+        .expect("healthz is reachable without a meter key");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "healthz returns 200 without authentication"
+    );
+
+    let response = client
+        .post(format!("{gateway_url}/healthz"))
+        .send()
+        .await
+        .expect("wrong method reaches the gateway");
+    assert_eq!(
+        response.status(),
+        StatusCode::METHOD_NOT_ALLOWED,
+        "wrong method on a known path returns 405 and is never forwarded"
+    );
+}

@@ -1,0 +1,13 @@
+# debitmetre example configuration — synthetic values only; never commit real meter keys.
+#
+# The machine_keys table maps the SHA-256 digest (lowercase hex) of each machine's
+# meter key to a stable machine id. Compute a digest for a real key with:
+#
+#   printf '%s' 'your-meter-key' | sha256sum
+#
+# Invalid or unreadable configuration makes the process exit non-zero before serving.
+
+listen = "127.0.0.1:8787"
+
+[machine_keys]
+"82805ec33616c4aa802f141d3703fb17213fd8ced358f3a62348d8cf6e1ce051" = "machine-a"

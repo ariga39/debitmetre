@@ -4,9 +4,11 @@ use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::Router;
 use sha2::{Digest, Sha256};
+
+pub mod config;
 
 #[cfg(all(not(test), target_os = "linux"))]
 #[global_allocator]
@@ -57,6 +59,7 @@ impl Gateway {
         Router::new()
             .route("/v1/responses", post(handle_responses))
             .route("/v1/responses/compact", post(handle_responses_compact))
+            .route("/healthz", get(healthz))
             .with_state(self.clone())
     }
 }
@@ -141,6 +144,13 @@ async fn handle_responses_compact(State(gateway): State<Gateway>, req: Request<B
     route_responses(gateway, req, "responses/compact").await
 }
 
+/// Minimal health endpoint (see DESIGN.md §2): no authentication required;
+/// returns 200 once a valid configuration is loaded and the listener is ready.
+async fn healthz() -> StatusCode {
+    tracing::debug!("health check");
+    StatusCode::OK
+}
+
 async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: &str) -> Response {
     let mut keys = req.headers().get_all("x-meter-key").iter();
     let (Some(key), None) = (keys.next(), keys.next()) else {
@@ -149,12 +159,19 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
     let Some(key) = key.to_str().ok() else {
         return unauthorized();
     };
-    if !gateway
-        .machine_keys
-        .contains_key(&digest_hex(key.as_bytes()))
-    {
+    let digest = digest_hex(key.as_bytes());
+    let Some(machine_id) = gateway.machine_keys.get(&digest) else {
+        tracing::info!(
+            route = endpoint_suffix,
+            "request rejected: missing or invalid meter key"
+        );
         return unauthorized();
-    }
+    };
+    tracing::info!(
+        route = endpoint_suffix,
+        machine_id = machine_id.as_str(),
+        "request accepted"
+    );
 
     let base_path = gateway.upstream_base.path().trim_end_matches('/');
     let mut upstream_url = gateway.upstream_base.clone();
@@ -181,6 +198,12 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
         .await
     {
         Ok(upstream) => {
+            tracing::info!(
+                route = endpoint_suffix,
+                machine_id = machine_id.as_str(),
+                status = upstream.status().as_u16(),
+                "upstream response"
+            );
             let connection_nominated = connection_nominated_headers(upstream.headers());
             let mut response = Response::builder().status(upstream.status());
             for (name, value) in upstream.headers().iter() {
@@ -193,6 +216,13 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
                 .body(axum::body::Body::from_stream(upstream.bytes_stream()))
                 .unwrap_or_else(|_| unauthorized())
         }
-        Err(_) => (StatusCode::BAD_GATEWAY, "upstream unreachable").into_response(),
+        Err(_) => {
+            tracing::error!(
+                route = endpoint_suffix,
+                machine_id = machine_id.as_str(),
+                "upstream request failed; returning 502"
+            );
+            (StatusCode::BAD_GATEWAY, "upstream unreachable").into_response()
+        }
     }
 }
