@@ -17,6 +17,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
+use tokio::io::AsyncReadExt;
 
 /// SHA-256 digest of `test-meter-key-machine-a`, precomputed with sha256sum and
 /// OpenSSL `dgst -sha256` (both agree); the config stores the digest, not the key.
@@ -48,6 +49,46 @@ async fn spawn_fake_upstream() -> String {
         axum::serve(listener, app)
             .await
             .expect("fake upstream runs");
+    });
+    format!("http://{addr}")
+}
+
+/// A deterministic transport-failure upstream: the listener stays bound for the
+/// whole test (so no unrelated test can capture the port), accepts the gateway
+/// connection, reads the request head, and closes without sending any HTTP
+/// response head — so reqwest must observe a transport error, never a 404 or
+/// another response from an unrelated server.
+async fn spawn_closing_upstream() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake upstream");
+    let addr = listener.local_addr().expect("fake upstream address");
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => return,
+            };
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match tokio::time::timeout(Duration::from_secs(3), stream.read(&mut chunk))
+                        .await
+                    {
+                        Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                        Ok(Ok(n)) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                // Close without writing any HTTP response head.
+                drop(stream);
+            });
+        }
     });
     format!("http://{addr}")
 }
@@ -359,6 +400,77 @@ async fn normal_and_non_2xx_upstream_responses_emit_distinct_structured_events()
     assert!(
         !logs.contains("opaque-upstream-error-body"),
         "logs must never print upstream error payloads"
+    );
+}
+
+#[tokio::test]
+async fn upstream_transport_failure_emits_distinct_error_event_with_safe_502() {
+    let upstream = spawn_closing_upstream().await;
+    let upstream_addr = upstream.trim_start_matches("http://").to_string();
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = write_config(&dir);
+    let gateway = GatewayProc::spawn(&config_path, Some(&upstream));
+
+    let port = gateway.bound_port();
+    wait_ready(port).await;
+
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let response = client
+        .post(format!("{base}/v1/responses"))
+        .header("x-meter-key", TEST_METER_KEY)
+        .body(REQUEST_BODY)
+        .send()
+        .await
+        .expect("caller reaches the running gateway");
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "transport failure keeps returning the generic 502"
+    );
+    assert_eq!(
+        response.bytes().await.expect("read 502 body").as_ref(),
+        &b"upstream unreachable"[..],
+        "502 body stays the existing generic safe text"
+    );
+
+    let logs = gateway.wait_for_logs(&["upstream transport error"]);
+    let error_line = logs
+        .lines()
+        .find(|line| line.contains("upstream transport error"))
+        .expect("the transport-failure event is logged");
+    assert!(
+        error_line.contains("ERROR"),
+        "upstream transport failure is an ERROR event, got: {error_line}"
+    );
+    assert!(
+        error_line.contains("route=\"responses\"")
+            && error_line.contains("machine_id=\"machine-a\""),
+        "transport failure event carries route/machine context when available, got: {error_line}"
+    );
+    assert!(
+        !error_line.contains(&upstream_addr),
+        "the transport event must not expose the upstream address"
+    );
+    assert!(
+        !logs.contains("connection refused")
+            && !logs.contains("os error")
+            && !logs.contains("error sending request"),
+        "no raw transport diagnostic may be logged"
+    );
+    assert!(
+        !logs.contains(TEST_METER_KEY),
+        "logs must never print the meter key"
+    );
+    assert!(
+        !logs.contains(REQUEST_BODY),
+        "logs must never print request bodies"
+    );
+    assert!(
+        !logs.contains(UPSTREAM_BODY),
+        "logs must never print response bodies"
     );
 }
 

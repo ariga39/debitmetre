@@ -334,7 +334,7 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
             tracing::error!(
                 route = endpoint_suffix,
                 machine_id = machine_id.as_str(),
-                "upstream request failed; returning 502"
+                "upstream transport error"
             );
             (StatusCode::BAD_GATEWAY, "upstream unreachable").into_response()
         }
