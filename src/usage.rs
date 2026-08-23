@@ -190,9 +190,13 @@ impl StreamUsageParser {
         }
     }
 
-    /// Whether the stream carried a terminal `response.incomplete` event.
+    /// Whether the stream carried a terminal `response.incomplete` event (SSE)
+    /// or the non-streaming body carries the `incomplete` marker.
     pub(crate) fn incomplete(&self) -> bool {
-        matches!(self, StreamUsageParser::Sse(p) if p.incomplete())
+        match self {
+            StreamUsageParser::Sse(p) => p.incomplete(),
+            StreamUsageParser::Json(p) => p.incomplete(),
+        }
     }
 }
 
@@ -352,6 +356,27 @@ impl JsonUsageParser {
             self.buf.clear();
             self.overflowed = true;
         }
+    }
+
+    /// Whether the buffered non-streaming body carries the `incomplete` lifecycle
+    /// marker: the top-level Responses `status` (ResponseStatus) is exactly
+    /// `incomplete`. A separate `incomplete_details` object is context, not
+    /// lifecycle authority. A body that overflowed or is not complete JSON
+    /// within the cap is not marked incomplete.
+    fn incomplete(&self) -> bool {
+        if self.overflowed {
+            return false;
+        }
+        serde_json::from_slice::<serde_json::Value>(&self.buf)
+            .ok()
+            .and_then(|root| {
+                root.as_object().and_then(|obj| {
+                    obj.get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|status| status == "incomplete")
+                })
+            })
+            .unwrap_or(false)
     }
 
     fn finish(&self) -> AuditResult {
