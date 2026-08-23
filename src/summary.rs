@@ -68,15 +68,11 @@ fn read_usage_file(path: &Path) -> Result<(BTreeMap<GroupKey, GroupTotals>, Read
         if bytes == 0 {
             break;
         }
-        if !line.ends_with(b"\n") {
-            // A crash can leave a trailing unfinished line (DESIGN.md §7).
-            // Ignore only that line so earlier complete records stay useful.
-            if !line.iter().all(u8::is_ascii_whitespace) {
-                warnings.partial_tail = true;
-            }
-            break;
+        let terminated = line.ends_with(b"\n");
+        let mut record = line.as_slice();
+        if terminated {
+            record = &record[..record.len() - 1];
         }
-        let mut record = &line[..line.len() - 1];
         if let Some(stripped) = record.strip_suffix(b"\r") {
             record = stripped;
         }
@@ -87,7 +83,20 @@ fn read_usage_file(path: &Path) -> Result<(BTreeMap<GroupKey, GroupTotals>, Read
                     accumulate_usage(groups.entry(key).or_default(), &usage);
                 }
             }
-            Err(_) => warnings.unparseable += 1,
+            Err(_) if terminated => warnings.unparseable += 1,
+            Err(_) => {
+                // A crash can leave a trailing unfinished line (DESIGN.md §7).
+                // Only a genuinely incomplete or invalid tail is ignored; a
+                // complete final record without a terminating newline above is
+                // already counted.
+                if !record.iter().all(u8::is_ascii_whitespace) {
+                    warnings.partial_tail = true;
+                }
+            }
+        }
+        if !terminated {
+            // The final line had no newline; there is nothing after it.
+            break;
         }
     }
     Ok((groups, warnings))

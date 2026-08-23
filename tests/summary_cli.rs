@@ -1,7 +1,7 @@
 //! CLI-level test (process seam) for the local `debitmetre summary` command
 //! (issue #3): runs the built binary against a synthetic config and a small
-//! synthetic usage file whose grouped totals are independently calculated by
-//! hand, then compares the command output with those known results.
+//! synthetic usage file, and compares the command output with a literal
+//! expectation whose grouped totals are independently calculated by hand.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -44,22 +44,18 @@ fn record(
     )
 }
 
-/// Independently known grouped totals, hand-calculated from the fixture above:
-///
-/// - machine-a / model-m1: 2 records
-///   input = 100+200 = 300, uncached = 60+150 = 210, cache_read = 20+30 = 50,
-///   cache_write = 20+20 = 40, output = 50+80 = 130, reasoning = 30+40 = 70,
-///   total = 150+280 = 430
-/// - machine-a / model-m2: 1 record; uncached and reasoning were never
-///   recorded, so they must show as missing (`-`), never 0:
-///   input = 40, cache_read = 10, cache_write = 10, output = 20, total = 60
-/// - machine-b / model-m1: 1 record: input = 10, uncached = 5, cache_read = 3,
-///   cache_write = 2, output = 6, reasoning = 2, total = 16
-///
-/// `tail` optionally appends an unfinished trailing line (no newline) the way a
-/// process crash can leave the file (DESIGN.md §7).
-fn usage_jsonl(tail: Option<&str>) -> String {
-    let mut body = [
+/// A fully valid canonical record whose `usage` is genuinely `null` (e.g. a
+/// transport error): it carries no token facts and must not create a group.
+fn null_usage_record() -> String {
+    r#"{"schema_version":1,"kind":"request","event_id":"evt-null-usage","timestamp":"2026-08-23T10:00:00Z","machine_id":"machine-c","operation":"response","upstream_status":200,"outcome":"completed","model":"model-m1","accounting_quality":"complete","metering_error":null,"usage":null}"#
+        .to_string()
+}
+
+/// The base fixture: four complete newline-terminated records plus a null-usage
+/// record. The grouped totals are the hand-calculated constants documented on
+/// [`EXPECTED_BASE_STDOUT`].
+fn base_fixture() -> String {
+    [
         record(
             "evt-a1",
             "machine-a",
@@ -108,75 +104,42 @@ fn usage_jsonl(tail: Option<&str>) -> String {
             "2",
             "16",
         ),
-        record(
-            "evt-null-usage",
-            "machine-c",
-            "model-m1",
-            "0",
-            "0",
-            "0",
-            "0",
-            "0",
-            "0",
-            "0",
-        )
-        .replace("\"usage\":{\"input_total\":0", "\"usage\":null"),
+        null_usage_record(),
     ]
     .join("\n")
-        + "\n";
-    if let Some(tail) = tail {
-        body.push_str(tail);
-    }
-    body
+        + "\n"
 }
 
-/// Replicates the command's fixed-width table formatting so the test can assert
-/// the exact stdout against the hand-calculated totals without counting spaces.
-fn expected_row(machine: &str, model: &str, records: u64, counters: [&str; 7]) -> String {
-    format!(
-        "{machine:<14}{model:<16}{records:>8} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
-        counters[0], counters[1], counters[2], counters[3], counters[4], counters[5], counters[6],
-    )
-}
+/// Complete expected stdout for the base fixture, as a literal — not a
+/// reconstruction of the renderer. The token totals are independently
+/// hand-calculated from the fixture:
+///
+/// - machine-a / model-m1 (2 records):
+///   input = 100+200 = 300, uncached = 60+150 = 210, cache_read = 20+30 = 50,
+///   cache_write = 20+20 = 40, output = 50+80 = 130, reasoning = 30+40 = 70,
+///   total = 150+280 = 430
+/// - machine-a / model-m2 (1 record; uncached and reasoning were never recorded
+///   and must show as `-`, never as 0):
+///   input = 40, cache_read = 10, cache_write = 10, output = 20, total = 60
+/// - machine-b / model-m1 (1 record): input = 10, uncached = 5, cache_read = 3,
+///   cache_write = 2, output = 6, reasoning = 2, total = 16
+const EXPECTED_BASE_STDOUT: &str = r#"machine       model            records        input     uncached   cache_read  cache_write       output    reasoning        total
+machine-a     model-m1               2          300          210           50           40          130           70          430
+machine-a     model-m2               1           40            -           10           10           20            -           60
+machine-b     model-m1               1           10            5            3            2            6            2           16
+- = not recorded in any record; totals sum only recorded values
+"#;
 
-fn expected_stdout() -> String {
-    let header = format!(
-        "{:<14}{:<16}{:>8} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
-        "machine",
-        "model",
-        "records",
-        "input",
-        "uncached",
-        "cache_read",
-        "cache_write",
-        "output",
-        "reasoning",
-        "total"
-    );
-    let rows = [
-        header,
-        expected_row(
-            "machine-a",
-            "model-m1",
-            2,
-            ["300", "210", "50", "40", "130", "70", "430"],
-        ),
-        expected_row(
-            "machine-a",
-            "model-m2",
-            1,
-            ["40", "-", "10", "10", "20", "-", "60"],
-        ),
-        expected_row(
-            "machine-b",
-            "model-m1",
-            1,
-            ["10", "5", "3", "2", "6", "2", "16"],
-        ),
-        "- = not recorded in any record; totals sum only recorded values".to_string(),
-    ];
-    rows.join("\n") + "\n"
-}
+/// Complete expected stdout when the final record (machine-b / model-m2) is
+/// also summarized: input = 22, uncached = 11, cache_read = 5, cache_write = 6,
+/// output = 12, reasoning = 4, total = 34, 1 record.
+const EXPECTED_STDOUT_WITH_FINAL_RECORD: &str = r#"machine       model            records        input     uncached   cache_read  cache_write       output    reasoning        total
+machine-a     model-m1               2          300          210           50           40          130           70          430
+machine-a     model-m2               1           40            -           10           10           20            -           60
+machine-b     model-m1               1           10            5            3            2            6            2           16
+machine-b     model-m2               1           22           11            5            6           12            4           34
+- = not recorded in any record; totals sum only recorded values
+"#;
 
 fn run_summary(config_path: &Path) -> (ExitStatus, String, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_debitmetre"))
@@ -198,12 +161,12 @@ fn run_summary(config_path: &Path) -> (ExitStatus, String, String) {
 fn summary_prints_independently_calculated_grouped_totals() {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let usage_file = dir.path().join("usage.jsonl");
-    std::fs::write(&usage_file, usage_jsonl(None)).expect("write synthetic usage file");
+    std::fs::write(&usage_file, base_fixture()).expect("write synthetic usage file");
     let config_path = write_config(&dir, &usage_file);
 
     let (status, stdout, stderr) = run_summary(&config_path);
     assert!(status.success(), "summary exits zero, stderr: {stderr}");
-    assert_eq!(stdout, expected_stdout());
+    assert_eq!(stdout, EXPECTED_BASE_STDOUT);
     // A record with usage=null is not a token fact: machine-c must not appear,
     // and the command never prints prices.
     assert!(
@@ -217,18 +180,46 @@ fn summary_prints_independently_calculated_grouped_totals() {
 fn unfinished_trailing_line_is_ignored_with_a_clear_warning() {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let usage_file = dir.path().join("usage.jsonl");
-    // A crash can leave the file ending mid-record without a final newline.
+    // A crash can leave the file ending mid-record without a final newline;
+    // this tail is genuinely incomplete (not parseable JSON).
     let tail = "{\"schema_version\":1,\"kind\":\"request\",\"event_id\":\"evt-crash\",\"timestamp\":\"2026-08-23T10:05:00Z\",\"machine_id\":\"machine-b\",\"operation\":\"response\",\"upstream_status\":200,\"outcome\":\"completed\",\"model\":\"model-m1\",\"accounting_quality\":\"complete\",\"metering_error\":null,\"usage\":{\"input_total\":9999,\"uncached\":";
-    std::fs::write(&usage_file, usage_jsonl(Some(tail))).expect("write synthetic usage file");
+    let mut contents = base_fixture();
+    contents.push_str(tail);
+    std::fs::write(&usage_file, contents).expect("write synthetic usage file");
     let config_path = write_config(&dir, &usage_file);
 
     let (status, stdout, stderr) = run_summary(&config_path);
     assert!(status.success(), "summary exits zero, stderr: {stderr}");
     // The trailing partial write is ignored; every earlier complete record is
     // still summarized with exactly the independent totals.
-    assert_eq!(stdout, expected_stdout());
+    assert_eq!(stdout, EXPECTED_BASE_STDOUT);
     assert!(
         stderr.contains("unfinished trailing line"),
         "understandable warning, got: {stderr}"
+    );
+}
+
+#[test]
+fn complete_final_record_without_newline_is_still_summarized() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let usage_file = dir.path().join("usage.jsonl");
+    // The last line is a fully valid canonical record whose terminating newline
+    // was lost; it must be summarized, not mistaken for a crash partial write.
+    let final_record = r#"{"schema_version":1,"kind":"request","event_id":"evt-b2","timestamp":"2026-08-23T10:00:00Z","machine_id":"machine-b","operation":"response","upstream_status":200,"outcome":"completed","model":"model-m2","accounting_quality":"complete","metering_error":null,"usage":{"input_total":22,"uncached":11,"cache_read":5,"cache_write":6,"output_total":12,"reasoning":4,"total":34}}"#;
+    let mut contents = base_fixture();
+    contents.push_str(final_record);
+    std::fs::write(&usage_file, contents).expect("write synthetic usage file");
+    let config_path = write_config(&dir, &usage_file);
+
+    let (status, stdout, stderr) = run_summary(&config_path);
+    assert!(status.success(), "summary exits zero, stderr: {stderr}");
+    assert_eq!(stdout, EXPECTED_STDOUT_WITH_FINAL_RECORD);
+    assert!(
+        !stderr.contains("unfinished trailing line"),
+        "a complete final record is not an unfinished tail, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("unparseable"),
+        "a complete final record is not skipped, got: {stderr}"
     );
 }
