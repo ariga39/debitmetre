@@ -644,6 +644,42 @@ fn invalid_or_unreadable_configuration_exits_fail_closed() {
 }
 
 #[test]
+fn configuration_failure_emits_distinct_error_event_on_stderr() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let missing = dir.path().join("missing.toml");
+    let (status, _stdout, stderr) = run_binary(&["--config", missing.to_str().unwrap()]);
+    assert!(
+        !status.success(),
+        "unloadable configuration must fail closed"
+    );
+
+    let error_line = stderr
+        .lines()
+        .find(|line| line.contains("configuration error"))
+        .unwrap_or_else(|| panic!("the configuration-failure event is logged; stderr:\n{stderr}"));
+    assert!(
+        error_line.contains("ERROR"),
+        "configuration failure is an ERROR event, got: {error_line}"
+    );
+    assert!(
+        error_line.contains("cannot read config"),
+        "the event carries a useful sanitized reason, got: {error_line}"
+    );
+    assert!(
+        !error_line.contains("upstream response")
+            && !error_line.contains("upstream error")
+            && !error_line.contains("upstream transport error"),
+        "configuration failure is distinct from all runtime upstream events, got: {error_line}"
+    );
+    assert!(
+        !stderr.contains(TEST_METER_KEY_DIGEST)
+            && !stderr.contains("authorization")
+            && !stderr.contains("Bearer"),
+        "no config contents, meter key digest, Authorization, or environment values are logged"
+    );
+}
+
+#[test]
 fn help_prints_the_documented_startup_command() {
     let (status, stdout, _stderr) = run_binary(&["--help"]);
     assert!(status.success(), "--help exits zero");
