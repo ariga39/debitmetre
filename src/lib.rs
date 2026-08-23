@@ -231,12 +231,21 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
         Ok(upstream) => {
             let status = upstream.status();
             let machine_id = machine_id.to_string();
-            tracing::info!(
-                route = endpoint_suffix,
-                machine_id = machine_id.as_str(),
-                status = status.as_u16(),
-                "upstream response"
-            );
+            if status.is_success() {
+                tracing::info!(
+                    route = endpoint_suffix,
+                    machine_id = machine_id.as_str(),
+                    status = status.as_u16(),
+                    "upstream response"
+                );
+            } else {
+                tracing::warn!(
+                    route = endpoint_suffix,
+                    machine_id = machine_id.as_str(),
+                    status = status.as_u16(),
+                    "upstream error"
+                );
+            }
             let connection_nominated = connection_nominated_headers(upstream.headers());
             let mut filtered_headers: Vec<(HeaderName, header::HeaderValue)> = Vec::new();
             for (name, value) in upstream.headers().iter() {

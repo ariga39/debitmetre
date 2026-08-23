@@ -30,6 +30,12 @@ async fn fake_upstream_handler(_req: Request<Body>) -> Response {
     (StatusCode::CREATED, UPSTREAM_BODY).into_response()
 }
 
+/// A fake upstream handler answering with a non-2xx status (upstream HTTP
+/// failure, DESIGN.md §5: the upstream owns its error status and body).
+async fn failing_upstream_handler(_req: Request<Body>) -> Response {
+    (StatusCode::TOO_MANY_REQUESTS, "opaque-upstream-error-body").into_response()
+}
+
 async fn spawn_fake_upstream() -> String {
     let app = Router::new()
         .route("/responses", post(fake_upstream_handler))
@@ -244,6 +250,115 @@ async fn runtime_audit_write_failure_is_fail_open_and_sanitized() {
     assert!(
         !logs.contains(UPSTREAM_BODY),
         "sanitized log must not leak response bodies"
+    );
+}
+
+#[tokio::test]
+async fn normal_and_non_2xx_upstream_responses_emit_distinct_structured_events() {
+    let app = Router::new()
+        .route("/responses", post(fake_upstream_handler))
+        .route("/responses/compact", post(failing_upstream_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake upstream");
+    let addr = listener.local_addr().expect("fake upstream address");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("fake upstream runs");
+    });
+    let upstream = format!("http://{addr}");
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = write_config(&dir);
+    let gateway = GatewayProc::spawn(&config_path, Some(&upstream));
+
+    let port = gateway.bound_port();
+    wait_ready(port).await;
+
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let response = client
+        .post(format!("{base}/v1/responses"))
+        .header("x-meter-key", TEST_METER_KEY)
+        .body(REQUEST_BODY)
+        .send()
+        .await
+        .expect("caller reaches the running gateway");
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "normal upstream response passes through unchanged"
+    );
+    assert_eq!(
+        response.bytes().await.expect("read response").as_ref(),
+        UPSTREAM_BODY.as_bytes(),
+        "normal upstream response body passes through byte-for-byte"
+    );
+
+    let response = client
+        .post(format!("{base}/v1/responses/compact"))
+        .header("x-meter-key", TEST_METER_KEY)
+        .body(REQUEST_BODY)
+        .send()
+        .await
+        .expect("caller reaches the running gateway");
+    assert_eq!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "non-2xx upstream response passes through unchanged"
+    );
+    assert_eq!(
+        response.bytes().await.expect("read response").as_ref(),
+        b"opaque-upstream-error-body",
+        "non-2xx upstream body passes through byte-for-byte"
+    );
+
+    let logs = gateway.wait_for_logs(&["upstream response", "upstream error"]);
+    let info_line = logs
+        .lines()
+        .find(|line| line.contains("upstream response"))
+        .expect("the normal-proxy event is logged");
+    let error_line = logs
+        .lines()
+        .find(|line| line.contains("upstream error"))
+        .expect("the upstream-http-failure event is logged");
+    assert!(
+        info_line.contains("INFO"),
+        "normal proxied request is an info event, got: {info_line}"
+    );
+    assert!(
+        error_line.contains("WARN"),
+        "upstream HTTP failure is a warn event, got: {error_line}"
+    );
+    assert!(
+        info_line.contains("route=\"responses\"")
+            && info_line.contains("machine_id=\"machine-a\"")
+            && info_line.contains("status=201"),
+        "normal event carries route/machine/status context, got: {info_line}"
+    );
+    assert!(
+        error_line.contains("route=\"responses/compact\"")
+            && error_line.contains("machine_id=\"machine-a\"")
+            && error_line.contains("status=429"),
+        "upstream HTTP failure event carries route/machine/status context, got: {error_line}"
+    );
+    assert!(
+        !logs.contains(TEST_METER_KEY),
+        "logs must never print the meter key"
+    );
+    assert!(
+        !logs.contains(REQUEST_BODY),
+        "logs must never print request bodies"
+    );
+    assert!(
+        !logs.contains(UPSTREAM_BODY),
+        "logs must never print response bodies"
+    );
+    assert!(
+        !logs.contains("opaque-upstream-error-body"),
+        "logs must never print upstream error payloads"
     );
 }
 
