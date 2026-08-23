@@ -9,5 +9,9 @@
 
 listen = "127.0.0.1:8787"
 
+# Append-only JSONL usage file (canonical request audit records). Opened at
+# startup: an invalid or unwritable path makes the process exit before serving.
+usage_file = "/var/lib/debitmetre/usage.jsonl"
+
 [machine_keys]
 "82805ec33616c4aa802f141d3703fb17213fd8ced358f3a62348d8cf6e1ce051" = "machine-a"

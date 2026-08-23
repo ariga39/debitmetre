@@ -47,11 +47,19 @@ async fn spawn_fake_upstream() -> String {
 }
 
 fn write_config(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    write_config_with_usage(dir, dir.path().join("usage.jsonl"))
+}
+
+fn write_config_with_usage(
+    dir: &tempfile::TempDir,
+    usage_file: std::path::PathBuf,
+) -> std::path::PathBuf {
     let path = dir.path().join("config.toml");
     std::fs::write(
         &path,
         format!(
-            "listen = \"127.0.0.1:0\"\n\n[machine_keys]\n\"{TEST_METER_KEY_DIGEST}\" = \"machine-a\"\n"
+            "listen = \"127.0.0.1:0\"\nusage_file = \"{}\"\n\n[machine_keys]\n\"{TEST_METER_KEY_DIGEST}\" = \"machine-a\"\n",
+            usage_file.display()
         ),
     )
     .expect("write synthetic config");
@@ -192,6 +200,54 @@ async fn wait_ready(port: u16) {
 }
 
 #[tokio::test]
+async fn runtime_audit_write_failure_is_fail_open_and_sanitized() {
+    let upstream = spawn_fake_upstream().await;
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    // /dev/full opens successfully (startup passes) but every write fails with
+    // ENOSPC: a transient runtime audit write failure must not corrupt the
+    // caller-visible upstream response.
+    let config_path = write_config_with_usage(&dir, std::path::PathBuf::from("/dev/full"));
+    let gateway = GatewayProc::spawn(&config_path, Some(&upstream));
+
+    let port = gateway.bound_port();
+    wait_ready(port).await;
+
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    let response = client
+        .post(format!("{base}/v1/responses"))
+        .header("x-meter-key", TEST_METER_KEY)
+        .body(REQUEST_BODY)
+        .send()
+        .await
+        .expect("caller reaches the running gateway");
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "upstream response unchanged despite the audit write failure"
+    );
+    assert_eq!(
+        response.bytes().await.expect("read response").as_ref(),
+        UPSTREAM_BODY.as_bytes(),
+        "body bytes unchanged despite the audit write failure"
+    );
+
+    let logs = gateway.wait_for_logs(&["audit_write_failed"]);
+    assert!(
+        !logs.contains(TEST_METER_KEY),
+        "sanitized log must not leak the meter key"
+    );
+    assert!(
+        !logs.contains(REQUEST_BODY),
+        "sanitized log must not leak request bodies"
+    );
+    assert!(
+        !logs.contains(UPSTREAM_BODY),
+        "sanitized log must not leak response bodies"
+    );
+}
+
+#[tokio::test]
 async fn built_binary_becomes_ready_and_serves_a_representative_request_lifecycle() {
     let upstream = spawn_fake_upstream().await;
     let dir = tempfile::TempDir::new().expect("temp dir");
@@ -231,11 +287,15 @@ async fn built_binary_becomes_ready_and_serves_a_representative_request_lifecycl
         "invalid meter key is rejected before the upstream"
     );
 
+    // The 201 opaque body is not parseable usage: the gateway must emit one
+    // sanitized metering warning (DESIGN.md §6) alongside the successful
+    // transparent forwarding.
     let logs_at_requests = gateway.wait_for_logs(&[
         "gateway listening",
         "request accepted",
         "upstream response",
         "request rejected",
+        "usage metering failed",
     ]);
     assert!(
         !logs_at_requests.contains(TEST_METER_KEY),
@@ -248,6 +308,27 @@ async fn built_binary_becomes_ready_and_serves_a_representative_request_lifecycl
     assert!(
         !logs_at_requests.contains(UPSTREAM_BODY),
         "logs must never print response bodies"
+    );
+
+    let metering_line = logs_at_requests
+        .lines()
+        .find(|line| line.contains("usage metering failed"))
+        .expect("the metering warning line is present");
+    assert!(
+        !metering_line.contains("machine-a"),
+        "metering warning must not leak machine identity"
+    );
+    assert!(
+        !metering_line.contains(TEST_METER_KEY),
+        "metering warning must not leak the meter key"
+    );
+    assert!(
+        !metering_line.contains(REQUEST_BODY),
+        "metering warning must not leak request bodies"
+    );
+    assert!(
+        !metering_line.contains(UPSTREAM_BODY),
+        "metering warning must not leak response bodies"
     );
 
     let status = gateway.stop_gracefully();
@@ -299,8 +380,11 @@ fn invalid_or_unreadable_configuration_exits_fail_closed() {
     );
 
     let empty = dir.path().join("empty.toml");
-    std::fs::write(&empty, "listen = \"127.0.0.1:8787\"\n\n[machine_keys]\n")
-        .expect("write empty-keys config");
+    std::fs::write(
+        &empty,
+        "listen = \"127.0.0.1:8787\"\nusage_file = \"/tmp/usage.jsonl\"\n\n[machine_keys]\n",
+    )
+    .expect("write empty-keys config");
     let (status, _stdout, stderr) = run_binary(&["--config", empty.to_str().unwrap()]);
     assert!(
         !status.success(),
@@ -309,6 +393,26 @@ fn invalid_or_unreadable_configuration_exits_fail_closed() {
     assert!(
         stderr.contains("machine_keys"),
         "useful validation error, got: {stderr}"
+    );
+
+    let bad_usage = dir.path().join("bad-usage.toml");
+    let missing_parent = dir.path().join("no-such-dir").join("usage.jsonl");
+    std::fs::write(
+        &bad_usage,
+        format!(
+            "listen = \"127.0.0.1:8787\"\nusage_file = \"{}\"\n\n[machine_keys]\n\"{TEST_METER_KEY_DIGEST}\" = \"machine-a\"\n",
+            missing_parent.display()
+        ),
+    )
+    .expect("write unwritable-usage-file config");
+    let (status, _stdout, stderr) = run_binary(&["--config", bad_usage.to_str().unwrap()]);
+    assert!(
+        !status.success(),
+        "unwritable usage-file path must fail closed at startup"
+    );
+    assert!(
+        stderr.contains("usage file") && stderr.contains("cannot open"),
+        "useful startup error naming the usage file, got: {stderr}"
     );
 }
 

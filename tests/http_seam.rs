@@ -25,6 +25,38 @@ use debitmetre::Gateway;
 const TEST_METER_KEY_DIGEST: &str =
     "82805ec33616c4aa802f141d3703fb17213fd8ced358f3a62348d8cf6e1ce051";
 
+/// A synthetic Responses SSE terminal event with independently known token
+/// counts (DESIGN.md §4): input_total=12, cache_read=4, cache_write=2,
+/// output_total=5, reasoning=2, total=17, so uncached = 12-4-2 = 6 and the
+/// accounting_quality is `complete`.
+const STREAMING_RESPONSE_FIXTURE: &str = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-synthetic-01\",\"model\":\"synthetic-model-001\",\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":4,\"cache_write_tokens\":2},\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":2},\"total_tokens\":17}}}\n\n";
+
+/// Parse the current JSONL usage-file content into records (audit seam).
+fn read_jsonl(path: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// Poll the JSONL usage file until the background writer has flushed a record.
+async fn wait_for_jsonl_record(path: &std::path::Path) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(record) = read_jsonl(path).into_iter().next() {
+            return record;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for a JSONL record in {}",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[derive(Clone, Default)]
 struct FakeUpstream {
     captured: Arc<Mutex<Vec<CapturedRequest>>>,
@@ -99,11 +131,13 @@ async fn responses_route_authenticates_valid_key_and_forwards_to_fake_upstream()
         .with_state(upstream.clone());
     let upstream_url = spawn(fake_app).await;
 
+    let usage_dir = tempfile::TempDir::new().unwrap();
     let machine_keys =
         BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
     let gateway = Gateway::for_tests(
         reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
         machine_keys,
+        usage_dir.path().join("usage.jsonl"),
     );
     let gateway_url = spawn(gateway.router()).await;
 
@@ -135,6 +169,193 @@ async fn responses_route_authenticates_valid_key_and_forwards_to_fake_upstream()
     assert_eq!(captured.method, "POST");
     assert_eq!(captured.path, "/responses");
     assert_eq!(captured.body, b"opaque-request-body-42");
+}
+
+#[tokio::test]
+async fn accepted_streaming_response_is_forwarded_unchanged_and_records_known_usage() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![
+            ("content-type".to_string(), "text/event-stream".to_string()),
+            (
+                "x-codex-semantic".to_string(),
+                "synthetic-semantic-01".to_string(),
+            ),
+        ],
+        body: STREAMING_RESPONSE_FIXTURE.as_bytes().to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .header("authorization", "Bearer synthetic-oauth-token-01")
+        .header("chatgpt-account-id", "synthetic-account-01")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-semantic")
+            .and_then(|v| v.to_str().ok()),
+        Some("synthetic-semantic-01"),
+        "caller-visible upstream headers preserved"
+    );
+    assert_eq!(
+        response
+            .bytes()
+            .await
+            .expect("gateway response body")
+            .as_ref(),
+        STREAMING_RESPONSE_FIXTURE.as_bytes(),
+        "caller-visible response bytes are byte-for-byte the upstream SSE"
+    );
+
+    let record = wait_for_jsonl_record(&usage_file).await;
+    assert_eq!(
+        read_jsonl(&usage_file).len(),
+        1,
+        "exactly one audit record per accepted request"
+    );
+    assert_eq!(record["schema_version"], 1);
+    assert_eq!(record["kind"], "request");
+    assert!(
+        record["event_id"].as_str().is_some_and(|id| !id.is_empty()),
+        "a gateway-generated event_id exists"
+    );
+    assert!(
+        record["timestamp"]
+            .as_str()
+            .is_some_and(|ts| ts.ends_with('Z')),
+        "timestamp is a UTC RFC3339 string"
+    );
+    assert_eq!(record["machine_id"], "machine-a");
+    assert_eq!(record["operation"], "response");
+    assert_eq!(record["upstream_status"], 200);
+    assert_eq!(record["outcome"], "completed");
+    assert_eq!(record["model"], "synthetic-model-001");
+    assert_eq!(record["accounting_quality"], "complete");
+    assert!(record["metering_error"].is_null());
+
+    let usage = &record["usage"];
+    assert_eq!(usage["input_total"], 12);
+    assert_eq!(usage["uncached"], 6);
+    assert_eq!(usage["cache_read"], 4);
+    assert_eq!(usage["cache_write"], 2);
+    assert_eq!(usage["output_total"], 5);
+    assert_eq!(usage["reasoning"], 2);
+    assert_eq!(usage["total"], 17);
+
+    let serialized = serde_json::to_string(&record).expect("record serializes");
+    for forbidden in [
+        "test-meter-key-machine-a",
+        "opaque-request-body-42",
+        "resp-synthetic-01",
+        "synthetic-oauth-token-01",
+        "synthetic-account-01",
+        "response.completed",
+    ] {
+        assert!(
+            !serialized.contains(forbidden),
+            "usage record must never contain {forbidden:?} (privacy allowlist)"
+        );
+    }
+}
+
+/// A synthetic non-streaming compact response (DESIGN.md §11: the real compact
+/// response shape is pending PoC, so this uses a conservative JSON body) with
+/// only `input_total` and `output_total` present: the absent counters must stay
+/// absent and the accounting quality is `partial`.
+const COMPACT_RESPONSE_FIXTURE: &str =
+    "{\"id\":\"comp-synthetic-01\",\"object\":\"response\",\"model\":\"synthetic-model-001\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}";
+
+#[tokio::test]
+async fn accepted_compact_request_records_its_own_line_with_absent_counters_absent() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses/compact", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![("content-type".to_string(), "application/json".to_string())],
+        body: COMPACT_RESPONSE_FIXTURE.as_bytes().to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses/compact"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-compact-body-07")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .bytes()
+            .await
+            .expect("gateway response body")
+            .as_ref(),
+        COMPACT_RESPONSE_FIXTURE.as_bytes(),
+        "compact response bytes are forwarded unchanged"
+    );
+
+    let record = wait_for_jsonl_record(&usage_file).await;
+    assert_eq!(record["kind"], "request");
+    assert_eq!(record["operation"], "compaction");
+    assert_eq!(record["machine_id"], "machine-a");
+    assert_eq!(record["upstream_status"], 200);
+    assert_eq!(record["outcome"], "completed");
+    assert_eq!(record["model"], "synthetic-model-001");
+    assert_eq!(record["accounting_quality"], "partial");
+    assert!(record["metering_error"].is_null());
+
+    let usage = &record["usage"];
+    assert_eq!(usage["input_total"], 3);
+    assert_eq!(usage["output_total"], 1);
+    assert!(
+        usage["uncached"].is_null()
+            && usage["cache_read"].is_null()
+            && usage["cache_write"].is_null()
+            && usage["reasoning"].is_null()
+            && usage["total"].is_null(),
+        "absent upstream counters remain null, never guessed or zeroed"
+    );
 }
 
 fn raw_request_head(extra_header_bytes: &[u8]) -> Vec<u8> {
@@ -182,11 +403,13 @@ async fn invalid_x_meter_key_forms_are_rejected_with_uniform_401_before_upstream
         .with_state(upstream.clone());
     let upstream_url = spawn(fake_app).await;
 
+    let usage_dir = tempfile::TempDir::new().unwrap();
     let machine_keys =
         BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
     let gateway = Gateway::for_tests(
         reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
         machine_keys,
+        usage_dir.path().join("usage.jsonl"),
     );
     let gateway_url = spawn(gateway.router()).await;
     let gateway_addr: SocketAddr = gateway_url
@@ -277,11 +500,13 @@ async fn closed_route_set_reaches_upstream_only_for_known_post_paths() {
         .with_state(upstream.clone());
     let upstream_url = spawn(fake_app).await;
 
+    let usage_dir = tempfile::TempDir::new().unwrap();
     let machine_keys =
         BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
     let gateway = Gateway::for_tests(
         reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
         machine_keys,
+        usage_dir.path().join("usage.jsonl"),
     );
     let gateway_url = spawn(gateway.router()).await;
 
@@ -390,11 +615,13 @@ async fn request_header_policy_strips_privacy_and_hop_headers_before_upstream() 
         .with_state(upstream.clone());
     let upstream_url = spawn(fake_app).await;
 
+    let usage_dir = tempfile::TempDir::new().unwrap();
     let machine_keys =
         BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
     let gateway = Gateway::for_tests(
         reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
         machine_keys,
+        usage_dir.path().join("usage.jsonl"),
     );
     let gateway_url = spawn(gateway.router()).await;
     let gateway_addr: SocketAddr = gateway_url
@@ -562,11 +789,13 @@ async fn opaque_bidirectional_streaming_relays_progress_in_order() {
         .with_state(upstream.clone());
     let upstream_url = spawn(fake_app).await;
 
+    let usage_dir = tempfile::TempDir::new().unwrap();
     let machine_keys =
         BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
     let gateway = Gateway::for_tests(
         reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
         machine_keys,
+        usage_dir.path().join("usage.jsonl"),
     );
     let gateway_url = spawn(gateway.router()).await;
 
@@ -674,11 +903,13 @@ async fn upstream_response_semantics_preserved_without_redirect_following() {
         .with_state(upstream.clone());
     let upstream_url = spawn(fake_app).await;
 
+    let usage_dir = tempfile::TempDir::new().unwrap();
     let machine_keys =
         BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
     let gateway = Gateway::for_tests(
         reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
         machine_keys,
+        usage_dir.path().join("usage.jsonl"),
     );
     let gateway_url = spawn(gateway.router()).await;
 
@@ -828,11 +1059,13 @@ async fn response_header_policy_strips_only_hop_by_hop() {
         .with_state(upstream.clone());
     let upstream_url = spawn(fake_app).await;
 
+    let usage_dir = tempfile::TempDir::new().unwrap();
     let machine_keys =
         BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
     let gateway = Gateway::for_tests(
         reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
         machine_keys,
+        usage_dir.path().join("usage.jsonl"),
     );
     let gateway_url = spawn(gateway.router()).await;
 
@@ -952,11 +1185,13 @@ async fn missing_authorization_still_reaches_upstream_which_owns_its_401() {
         .with_state(upstream.clone());
     let upstream_url = spawn(fake_app).await;
 
+    let usage_dir = tempfile::TempDir::new().unwrap();
     let machine_keys =
         BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
     let gateway = Gateway::for_tests(
         reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
         machine_keys,
+        usage_dir.path().join("usage.jsonl"),
     );
     let gateway_url = spawn(gateway.router()).await;
 
@@ -1087,11 +1322,13 @@ async fn transport_failure_returns_safe_generic_502() {
     let dead_addr = listener.local_addr().expect("resolved address");
     drop(listener);
 
+    let usage_dir = tempfile::TempDir::new().unwrap();
     let machine_keys =
         BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
     let gateway = Gateway::for_tests(
         reqwest::Url::parse(&format!("http://{dead_addr}")).expect("dead upstream url"),
         machine_keys,
+        usage_dir.path().join("usage.jsonl"),
     );
     let gateway_url = spawn(gateway.router()).await;
 
@@ -1135,11 +1372,13 @@ async fn caller_cancellation_stops_upstream_pumping() {
         .with_state(upstream.clone());
     let upstream_url = spawn(fake_app).await;
 
+    let usage_dir = tempfile::TempDir::new().unwrap();
     let machine_keys =
         BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
     let gateway = Gateway::for_tests(
         reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
         machine_keys,
+        usage_dir.path().join("usage.jsonl"),
     );
     let gateway_url = spawn(gateway.router()).await;
     let gateway_addr: SocketAddr = gateway_url
@@ -1198,12 +1437,14 @@ async fn prefixed_upstream_base_preserves_codex_prefix_on_both_routes() {
         .with_state(upstream.clone());
     let upstream_url = spawn(fake_app).await;
 
+    let usage_dir = tempfile::TempDir::new().unwrap();
     let machine_keys =
         BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
     let gateway = Gateway::for_tests(
         reqwest::Url::parse(&format!("{upstream_url}/backend-api/codex/"))
             .expect("prefixed fake upstream url"),
         machine_keys,
+        usage_dir.path().join("usage.jsonl"),
     );
     let gateway_url = spawn(gateway.router()).await;
 
@@ -1251,11 +1492,13 @@ async fn prefixed_upstream_base_preserves_codex_prefix_on_both_routes() {
 
 #[tokio::test]
 async fn healthz_returns_200_without_authentication_and_rejects_other_methods() {
+    let usage_dir = tempfile::TempDir::new().unwrap();
     let machine_keys =
         BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
     let gateway = Gateway::for_tests(
         reqwest::Url::parse("http://127.0.0.1:9").expect("unused upstream url"),
         machine_keys,
+        usage_dir.path().join("usage.jsonl"),
     );
     let gateway_url = spawn(gateway.router()).await;
 

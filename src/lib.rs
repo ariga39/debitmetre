@@ -1,14 +1,20 @@
 use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
+use std::sync::Arc;
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 
 pub mod config;
+mod usage;
+
+use usage::{AccountingQuality, AuditRecord, Operation, Outcome, StreamUsageParser};
 
 #[cfg(all(not(test), target_os = "linux"))]
 #[global_allocator]
@@ -23,36 +29,53 @@ pub const PRODUCTION_UPSTREAM_BASE: &str = "https://chatgpt.com/backend-api/code
 
 /// Central transparent proxy gateway.
 ///
-/// Constructed in-process with the server-side key mapping; the returned router
-/// exposes the fixed route set. The injectable upstream base is a test seam
-/// ([`Gateway::for_tests`]); production uses [`Gateway::production`].
+/// Constructed in-process with the server-side key mapping and the append-only
+/// usage file; the returned router exposes the fixed route set. The injectable
+/// upstream base is a test seam ([`Gateway::for_tests`]); production uses
+/// [`Gateway::production`]. Each accepted request streams its upstream response
+/// to the caller unchanged while a bounded side-band parser extracts usage and
+/// produces one canonical JSONL record (DESIGN.md §5, §10 audit seam).
 #[derive(Clone)]
 pub struct Gateway {
     client: reqwest::Client,
     upstream_base: reqwest::Url,
     machine_keys: MachineKeys,
+    audit: Arc<usage::AuditWriter>,
 }
 
 impl Gateway {
     /// Test seam: injectable upstream base URL pointing at a fake upstream in
-    /// tests. This is not a production configuration option; production is
-    /// built with [`Gateway::production`].
-    pub fn for_tests(upstream_base: reqwest::Url, machine_keys: MachineKeys) -> Self {
+    /// tests, and a usage file for the audit seam. This is not a production
+    /// configuration option; production is built with [`Gateway::production`].
+    /// Opening the usage file fails fast (startup fail-closed).
+    pub fn for_tests(
+        upstream_base: reqwest::Url,
+        machine_keys: MachineKeys,
+        usage_file: impl AsRef<Path>,
+    ) -> Self {
+        let audit = usage::AuditWriter::start(usage_file).expect("open test usage file");
         Self {
             client: build_client(),
             upstream_base,
             machine_keys,
+            audit: Arc::new(audit),
         }
     }
 
-    /// Production constructor: fixed upstream base with redirects disabled.
-    pub fn production(machine_keys: MachineKeys) -> Self {
-        Self {
+    /// Production constructor: fixed upstream base with redirects disabled and
+    /// the configured usage file opened fail-closed.
+    pub fn production(
+        machine_keys: MachineKeys,
+        usage_file: impl AsRef<Path>,
+    ) -> Result<Self, std::io::Error> {
+        let audit = usage::AuditWriter::start(usage_file)?;
+        Ok(Self {
             client: build_client(),
             upstream_base: reqwest::Url::parse(PRODUCTION_UPSTREAM_BASE)
                 .expect("fixed production upstream base is valid"),
             machine_keys,
-        }
+            audit: Arc::new(audit),
+        })
     }
 
     pub fn router(&self) -> Router {
@@ -173,6 +196,12 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
         "request accepted"
     );
 
+    let operation = if endpoint_suffix == "responses" {
+        Operation::Response
+    } else {
+        Operation::Compaction
+    };
+
     let base_path = gateway.upstream_base.path().trim_end_matches('/');
     let mut upstream_url = gateway.upstream_base.clone();
     upstream_url.set_path(&format!("{base_path}/{endpoint_suffix}"));
@@ -198,25 +227,81 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
         .await
     {
         Ok(upstream) => {
+            let status = upstream.status();
+            let machine_id = machine_id.to_string();
             tracing::info!(
                 route = endpoint_suffix,
                 machine_id = machine_id.as_str(),
-                status = upstream.status().as_u16(),
+                status = status.as_u16(),
                 "upstream response"
             );
             let connection_nominated = connection_nominated_headers(upstream.headers());
-            let mut response = Response::builder().status(upstream.status());
+            let mut filtered_headers: Vec<(HeaderName, header::HeaderValue)> = Vec::new();
             for (name, value) in upstream.headers().iter() {
                 if response_header_is_stripped(name, &connection_nominated) {
                     continue;
                 }
+                filtered_headers.push((name.clone(), value.clone()));
+            }
+
+            let streaming = is_event_stream(&filtered_headers);
+            let (tx, rx) =
+                tokio::sync::mpsc::channel::<Result<Bytes, std::convert::Infallible>>(16);
+            let audit = Arc::clone(&gateway.audit);
+            let status_u16 = status.as_u16();
+            let is_success = status.is_success();
+            tokio::spawn(async move {
+                let mut parser = if streaming {
+                    StreamUsageParser::sse()
+                } else {
+                    StreamUsageParser::json()
+                };
+                let mut outcome = Outcome::Completed;
+                let mut stream = upstream.bytes_stream();
+                loop {
+                    match stream.next().await {
+                        Some(Ok(bytes)) => {
+                            parser.push(&bytes);
+                            if tx.send(Ok(bytes)).await.is_err() {
+                                // Caller dropped the response body: stop pumping
+                                // upstream (DESIGN.md §5 client_cancelled).
+                                outcome = Outcome::ClientCancelled;
+                                break;
+                            }
+                        }
+                        Some(Err(_)) => {
+                            outcome = Outcome::UpstreamInterrupted;
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+                record_audit(
+                    &audit,
+                    &machine_id,
+                    operation,
+                    status_u16,
+                    is_success,
+                    outcome,
+                    &parser,
+                );
+            });
+
+            let mut response = Response::builder().status(status);
+            for (name, value) in filtered_headers {
                 response = response.header(name, value);
             }
             response
-                .body(axum::body::Body::from_stream(upstream.bytes_stream()))
+                .body(axum::body::Body::from_stream(
+                    tokio_stream::wrappers::ReceiverStream::new(rx),
+                ))
                 .unwrap_or_else(|_| unauthorized())
         }
         Err(_) => {
+            let mut record = AuditRecord::new(machine_id.to_string(), operation);
+            record.upstream_status = None;
+            record.outcome = Outcome::TransportError;
+            gateway.audit.try_record(record);
             tracing::error!(
                 route = endpoint_suffix,
                 machine_id = machine_id.as_str(),
@@ -225,4 +310,62 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
             (StatusCode::BAD_GATEWAY, "upstream unreachable").into_response()
         }
     }
+}
+
+/// Record the canonical audit line for an accepted request at its terminal
+/// state (DESIGN.md §5 scenario mapping). Non-2xx responses record
+/// `upstream_error` and never meter usage; for 2xx responses the side-band
+/// parser supplies model/usage/quality or an explicit metering error.
+fn record_audit(
+    audit: &usage::AuditWriter,
+    machine_id: &str,
+    operation: Operation,
+    upstream_status: u16,
+    is_success: bool,
+    outcome: Outcome,
+    parser: &StreamUsageParser,
+) {
+    let mut record = AuditRecord::new(machine_id.to_string(), operation);
+    record.upstream_status = Some(upstream_status);
+    record.outcome = if !is_success {
+        Outcome::UpstreamError
+    } else if outcome == Outcome::Completed && parser.incomplete() {
+        Outcome::Incomplete
+    } else {
+        outcome
+    };
+    if is_success {
+        let result = parser.finish();
+        record.model = result.model;
+        record.usage = result.usage;
+        record.accounting_quality = result.quality;
+        record.metering_error = result.metering_error;
+        // A successful upstream response whose usage could not be extracted is
+        // metering failure (DESIGN.md §6): the caller-visible response stays
+        // unchanged, and the operator gets one concise sanitized warning. Only
+        // the safe enum field is logged — never machine id, path, headers,
+        // credentials, body, or raw usage.
+        if let Some(metering_error) = result.metering_error {
+            tracing::warn!(
+                metering_error = ?metering_error,
+                "usage metering failed; the upstream response is unaffected"
+            );
+        }
+    } else {
+        record.usage = None;
+        record.accounting_quality = AccountingQuality::Unavailable;
+        record.metering_error = None;
+    }
+    audit.try_record(record);
+}
+
+/// The bypass extractor selects its parsing mode based on the response
+/// Content-Type (DESIGN.md §2): `text/event-stream` uses the incremental SSE
+/// parser, everything else the bounded JSON parser.
+fn is_event_stream(headers: &[(HeaderName, header::HeaderValue)]) -> bool {
+    headers
+        .iter()
+        .find(|(name, _)| name == header::CONTENT_TYPE)
+        .and_then(|(_, value)| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
 }

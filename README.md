@@ -54,14 +54,21 @@ printf '%s' 'test-meter-key-machine-a' | sha256sum
 # config.example.toml — synthetic example; do not commit real meter keys
 listen = "127.0.0.1:8787"
 
+# Append-only JSONL usage file; opened at startup (fail-closed on bad path).
+usage_file = "/var/lib/debitmetre/usage.jsonl"
+
 [machine_keys]
 "82805ec33616c4aa802f141d3703fb17213fd8ced358f3a62348d8cf6e1ce051" = "machine-a"
 ```
 
 The gateway binds the configured `listen` address (typically loopback, with nginx terminating TLS at
 the edge, see DESIGN.md §8) and refuses to start on invalid or unreadable configuration:
-missing file, malformed TOML, unknown fields, an invalid listen address, an empty `machine_keys`
-table, a non-64-character lowercase-hex digest, or a blank machine id all exit non-zero with a useful error.
+missing file, malformed TOML, unknown fields, an invalid listen address, a blank `usage_file`,
+an empty `machine_keys` table, a non-64-character lowercase-hex digest, or a blank machine id all
+exit non-zero with a useful error. The configured `usage_file` is opened at startup the same way:
+an invalid or unwritable path prevents startup, while a transient write failure after startup is
+fail-open (the caller-visible upstream response stays unchanged and a sanitized `audit_write_failed`
+diagnostic is emitted to stderr).
 
 ### Check readiness and traffic
 

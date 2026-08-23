@@ -15,6 +15,9 @@ pub struct Config {
     pub listen: SocketAddr,
     /// SHA-256 digest (lowercase hex) of each meter key -> stable machine id.
     pub machine_keys: MachineKeys,
+    /// Append-only JSONL usage file; opened at startup (fail-closed) and
+    /// written best-effort at runtime (fail-open, see DESIGN.md §6-§7).
+    pub usage_file: PathBuf,
 }
 
 /// Load and validate the startup configuration from a TOML file. Any failure
@@ -48,6 +51,7 @@ fn is_digest_hex(s: &str) -> bool {
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     listen: String,
+    usage_file: String,
     machine_keys: BTreeMap<String, String>,
 }
 
@@ -63,6 +67,13 @@ impl Config {
         let listen = raw.listen.parse::<SocketAddr>().map_err(|_| {
             validation("listen must be a valid IP:port address, e.g. \"127.0.0.1:8787\"".into())
         })?;
+
+        let usage_file = PathBuf::from(raw.usage_file);
+        if usage_file.as_os_str().is_empty() {
+            return Err(validation(
+                "usage_file must be a non-empty file path".into(),
+            ));
+        }
 
         if raw.machine_keys.is_empty() {
             return Err(validation(
@@ -87,6 +98,7 @@ impl Config {
         Ok(Config {
             listen,
             machine_keys,
+            usage_file,
         })
     }
 }
@@ -142,6 +154,8 @@ mod tests {
     const TEST_METER_KEY_DIGEST: &str =
         "82805ec33616c4aa802f141d3703fb17213fd8ced358f3a62348d8cf6e1ce051";
 
+    const VALID_USAGE_FILE: &str = "/var/lib/debitmetre/usage.jsonl";
+
     fn write_config(dir: &tempfile::TempDir, body: &str) -> std::path::PathBuf {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, body).expect("write synthetic config");
@@ -149,12 +163,12 @@ mod tests {
     }
 
     #[test]
-    fn valid_config_loads_listen_and_machine_keys() {
+    fn valid_config_loads_listen_machine_keys_and_usage_file() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = write_config(
             &dir,
             &format!(
-                "listen = \"127.0.0.1:8787\"\n\n[machine_keys]\n\"{TEST_METER_KEY_DIGEST}\" = \"machine-a\"\n"
+                "listen = \"127.0.0.1:8787\"\nusage_file = \"{VALID_USAGE_FILE}\"\n\n[machine_keys]\n\"{TEST_METER_KEY_DIGEST}\" = \"machine-a\"\n"
             ),
         );
         let cfg = load(&path).expect("synthetic config is valid");
@@ -162,6 +176,7 @@ mod tests {
             cfg.listen,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8787)
         );
+        assert_eq!(cfg.usage_file, PathBuf::from(VALID_USAGE_FILE));
         assert_eq!(
             cfg.machine_keys,
             MachineKeys::from([(TEST_METER_KEY_DIGEST.to_string(), "machine-a".to_string())])
@@ -206,7 +221,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let path = write_config(
             &dir,
-            "listen = \"not-an-address\"\n\n[machine_keys]\n\"x\" = \"machine-a\"\n",
+            "listen = \"not-an-address\"\nusage_file = \"/tmp/usage.jsonl\"\n\n[machine_keys]\n\"x\" = \"machine-a\"\n",
         );
         let err = load(&path).expect_err("invalid listen must fail");
         assert!(
@@ -218,7 +233,10 @@ mod tests {
     #[test]
     fn empty_machine_keys_are_rejected() {
         let dir = tempfile::TempDir::new().unwrap();
-        let path = write_config(&dir, "listen = \"127.0.0.1:8787\"\n\n[machine_keys]\n");
+        let path = write_config(
+            &dir,
+            "listen = \"127.0.0.1:8787\"\nusage_file = \"/tmp/usage.jsonl\"\n\n[machine_keys]\n",
+        );
         let err = load(&path).expect_err("no machine mapping must fail");
         assert!(
             err.to_string().contains("machine_keys"),
@@ -243,7 +261,7 @@ mod tests {
             let path = write_config(
                 &dir,
                 &format!(
-                    "listen = \"127.0.0.1:8787\"\n\n[machine_keys]\n\"{digest}\" = \"machine-a\"\n"
+                    "listen = \"127.0.0.1:8787\"\nusage_file = \"/tmp/usage.jsonl\"\n\n[machine_keys]\n\"{digest}\" = \"machine-a\"\n"
                 ),
             );
             let err = load(&path).expect_err("malformed digest must fail");
@@ -261,13 +279,29 @@ mod tests {
         let path = write_config(
             &dir,
             &format!(
-                "listen = \"127.0.0.1:8787\"\n\n[machine_keys]\n\"{TEST_METER_KEY_DIGEST}\" = \"   \"\n"
+                "listen = \"127.0.0.1:8787\"\nusage_file = \"/tmp/usage.jsonl\"\n\n[machine_keys]\n\"{TEST_METER_KEY_DIGEST}\" = \"   \"\n"
             ),
         );
         let err = load(&path).expect_err("blank machine id must fail");
         assert!(
             err.to_string().contains("machine id"),
             "error names the machine id, got: {err}"
+        );
+    }
+
+    #[test]
+    fn blank_usage_file_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write_config(
+            &dir,
+            &format!(
+                "listen = \"127.0.0.1:8787\"\nusage_file = \"\"\n\n[machine_keys]\n\"{TEST_METER_KEY_DIGEST}\" = \"machine-a\"\n"
+            ),
+        );
+        let err = load(&path).expect_err("blank usage_file must fail");
+        assert!(
+            err.to_string().contains("usage_file"),
+            "error names usage_file, got: {err}"
         );
     }
 }

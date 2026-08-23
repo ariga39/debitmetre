@@ -78,13 +78,25 @@ fn init_logging() {
 /// Test-only seam (feature `test-upstream-override`): point the fixed upstream
 /// at a fake upstream via `DEBITMETRE_TEST_UPSTREAM`. Production builds never
 /// enable the feature, so the upstream stays fixed in code (SSRF prevention).
-fn build_gateway(cfg: &Config) -> Gateway {
+/// Opening the configured usage file is part of gateway construction: a bad
+/// path fails startup (fail-closed, DESIGN.md §6).
+fn build_gateway(cfg: &Config) -> Result<Gateway, String> {
+    let open_usage_file = |gateway: Result<Gateway, std::io::Error>| {
+        gateway.map_err(|err| format!("cannot open usage file {}: {err}", cfg.usage_file.display()))
+    };
     #[cfg(feature = "test-upstream-override")]
     if let Ok(base) = std::env::var("DEBITMETRE_TEST_UPSTREAM") {
         let url = reqwest::Url::parse(&base).expect("DEBITMETRE_TEST_UPSTREAM must be a valid URL");
-        return Gateway::for_tests(url, cfg.machine_keys.clone());
+        return open_usage_file(Ok(Gateway::for_tests(
+            url,
+            cfg.machine_keys.clone(),
+            &cfg.usage_file,
+        )));
     }
-    Gateway::production(cfg.machine_keys.clone())
+    open_usage_file(Gateway::production(
+        cfg.machine_keys.clone(),
+        &cfg.usage_file,
+    ))
 }
 
 #[tokio::main]
@@ -113,6 +125,14 @@ async fn main() -> ExitCode {
         }
     };
 
+    let app = match build_gateway(&cfg) {
+        Ok(gateway) => gateway.router(),
+        Err(err) => {
+            tracing::error!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let listener = match tokio::net::TcpListener::bind(cfg.listen).await {
         Ok(listener) => listener,
         Err(err) => {
@@ -134,7 +154,6 @@ async fn main() -> ExitCode {
         "gateway listening"
     );
 
-    let app = build_gateway(&cfg).router();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let mut server = tokio::spawn(async move {
         axum::serve(listener, app)
