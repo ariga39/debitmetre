@@ -29,7 +29,7 @@ It does not probe OpenAI, does not leak any configuration content, and does not 
 - Unknown paths return 404; wrong methods on known paths return 405; neither is ever forwarded to the upstream.
 - The production upstream is fixed in code and cannot be changed via configuration (SSRF prevention); following upstream redirects is forbidden.
 - Tests may inject a fake upstream at process/module construction time; no such option exists in production configuration.
-- Both SSE streaming and non-streaming JSON responses are transparently supported; the bypass extractor selects its parsing mode based on the response Content-Type.
+- Both SSE streaming and non-streaming JSON responses are transparently supported. Content-Type alone is not authoritative for Responses framing: a body labeled `application/json` can still be SSE-framed (the Codex client feeds the response bytes to its own SSE parser regardless of Content-Type). The extractor runs two bounded observers over the same stream — an SSE observer and a non-streaming JSON observer — and selects the grounded terminal result: a terminal `response.completed` / `response.incomplete` SSE event wins, otherwise the complete non-streaming JSON body wins. Both observers stay bounded; the whole body is never accumulated.
 
 ### 2.1 Semantic transparency boundary
 

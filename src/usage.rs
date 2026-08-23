@@ -1,10 +1,11 @@
 //! Canonical JSONL usage audit: the record schema (DESIGN.md §5), bounded
 //! SSE/JSON usage extraction (§4), and a bounded fail-open JSONL writer (§7).
 //!
-//! The `SseUsageParser` streaming side-band parser is adapted from
-//! `src/gateway.rs` and the bounded single-writer JSONL audit writer from
-//! `src/audit.rs` in [ariga39/orihsus] (MIT OR Apache-2.0, Copyright (c) 2026
-//! Kagami) at revision `7285dd5c6a7ec5f1c0e521c6ee71f70e659d6220`; see
+//! The `SseUsageParser` and `JsonUsageParser` side-band observers and the
+//! `StreamUsageParser` container are adapted from `src/gateway.rs` and the
+//! bounded single-writer JSONL audit writer from `src/audit.rs` in
+//! [ariga39/orihsus] (MIT OR Apache-2.0, Copyright (c) 2026 Kagami) at
+//! revision `7285dd5c6a7ec5f1c0e521c6ee71f70e659d6220`; see
 //! THIRD-PARTY-NOTICES.md. orihsus's key-pool/retry/quota/product semantics are
 //! not imported. The token-accounting basis (mutually exclusive input buckets,
 //! derived `uncached`, non-negativity) follows DESIGN.md §4.
@@ -29,9 +30,13 @@ const AUDIT_QUEUE_CAPACITY: usize = 2048;
 /// Maximum bytes of one SSE event buffered for usage extraction (DESIGN.md
 /// §4.1). A larger event is still forwarded in full but records
 /// `metering_error=event_too_large`; the limit is an implementation parameter.
-/// A non-streaming JSON body that never frames as SSE is also extracted from
-/// this same bounded buffer, so the gateway never accumulates a whole body.
 const SSE_EVENT_CAP: usize = 256 * 1024;
+
+/// Fixed small cap on the buffered bytes of a non-streaming JSON response body
+/// used to extract usage. A body larger than this (or one that never reaches
+/// EOF) is forwarded untouched and records null usage — the gateway never
+/// accumulates a whole body.
+const JSON_USAGE_CAP: usize = 64 * 1024;
 
 /// `kind` is fixed by the canonical schema (DESIGN.md §5).
 const KIND: &str = "request";
@@ -156,40 +161,61 @@ pub(crate) struct AuditResult {
 
 /// Side-band response-body usage parser.
 ///
-/// It parses the response byte stream as SSE regardless of the upstream
-/// Content-Type: the Codex Responses client feeds the same bytes to its own SSE
-/// parser (pinned codex-cli 0.149.0, `codex-rs/codex-api/src/sse/responses.rs`),
-/// and real responses can be SSE-framed even under a JSON Content-Type. A body
-/// that never frames as SSE (a genuinely non-streaming JSON Responses body) is
-/// extracted from the same bounded event buffer as complete JSON; buffering is
-/// bounded by [`SSE_EVENT_CAP`], never the whole body.
-pub(crate) struct StreamUsageParser(SseUsageParser);
+/// Runs two bounded observers over the response byte stream — the SSE observer
+/// ([`SseUsageParser`]) and the non-streaming JSON observer
+/// ([`JsonUsageParser`]) — and selects the grounded terminal result. Content-Type
+/// alone is not authoritative for Responses framing: the Codex Responses client
+/// feeds the same bytes to its own SSE parser regardless of Content-Type
+/// (pinned codex-cli 0.149.0, `codex-rs/codex-api/src/sse/responses.rs`), so a
+/// JSON-labeled body can still be SSE-framed. A body is metered as SSE only when
+/// a terminal `response.completed` / `response.incomplete` event is actually
+/// observed; otherwise the complete non-streaming JSON body owns the result.
+/// Both observers are bounded ([`SSE_EVENT_CAP`] per SSE event,
+/// [`JSON_USAGE_CAP`] per JSON body); the whole body is never accumulated.
+pub(crate) struct StreamUsageParser {
+    sse: SseUsageParser,
+    json: JsonUsageParser,
+}
 
 impl StreamUsageParser {
     pub(crate) fn sse() -> Self {
-        StreamUsageParser(SseUsageParser::new(SSE_EVENT_CAP))
+        StreamUsageParser {
+            sse: SseUsageParser::new(SSE_EVENT_CAP),
+            json: JsonUsageParser::new(JSON_USAGE_CAP),
+        }
     }
 
     pub(crate) fn push(&mut self, chunk: &[u8]) {
-        self.0.push(chunk);
+        self.sse.push(chunk);
+        self.json.push(chunk);
     }
 
-    /// Finalize parsing after the stream reaches its terminal state.
+    /// Finalize parsing after the stream reaches its terminal state: the SSE
+    /// observer owns the result when it observed a terminal event; otherwise
+    /// the non-streaming JSON body owns it.
     pub(crate) fn finish(&self) -> AuditResult {
-        self.0.finish()
+        if self.sse.terminal_seen() {
+            self.sse.finish()
+        } else {
+            self.json.finish()
+        }
     }
 
     /// Whether the stream carried a terminal `response.incomplete` event (SSE)
-    /// or a non-streaming JSON body carries the top-level `incomplete` marker.
+    /// or the non-streaming JSON body carries the top-level `incomplete` marker.
     pub(crate) fn incomplete(&self) -> bool {
-        self.0.incomplete()
+        if self.sse.terminal_seen() {
+            self.sse.incomplete()
+        } else {
+            self.json.incomplete()
+        }
     }
 
-    /// Whether the parser observed a terminal event: a `response.completed` or
-    /// `response.incomplete` SSE event (DESIGN.md §4.1), or a complete
-    /// non-streaming JSON body that never framed as SSE.
+    /// Whether the parser observed a grounded terminal state: a
+    /// `response.completed` / `response.incomplete` SSE event (DESIGN.md §4.1)
+    /// or a complete non-streaming JSON body within the cap.
     pub(crate) fn terminal_seen(&self) -> bool {
-        self.0.terminal_seen()
+        self.sse.terminal_seen() || self.json.terminal_seen()
     }
 }
 
@@ -199,10 +225,7 @@ impl StreamUsageParser {
 /// delimiters split across arbitrary chunk boundaries. An event larger than
 /// `event_cap` is marked for discard until its delimiter arrives, so a
 /// truncated event is never mis-parsed; such an event still records
-/// `metering_error=event_too_large` when no valid usage was seen. A body that
-/// never frames as SSE is extracted from the same bounded buffer as complete
-/// JSON (see [`json_body_audit`]), which preserves non-streaming Responses
-/// behavior without a separate whole-body buffer.
+/// `metering_error=event_too_large` when no valid usage was seen.
 pub(crate) struct SseUsageParser {
     event_buf: Vec<u8>,
     event_cap: usize,
@@ -303,107 +326,145 @@ impl SseUsageParser {
     }
 
     fn incomplete(&self) -> bool {
-        if self.terminal_incomplete {
-            return true;
-        }
-        // A body that never framed as SSE: the non-streaming lifecycle marker
-        // is the top-level Responses `status` exactly `incomplete`.
-        !self.oversized && json_body_incomplete(&self.event_buf)
+        self.terminal_incomplete
     }
 
     fn terminal_seen(&self) -> bool {
-        if self.terminal_seen {
-            return true;
-        }
-        // A body that never framed as SSE but is complete JSON within the cap
-        // is inherently terminal once fully received.
-        !self.oversized && json_body_audit(&self.event_buf).is_some()
+        self.terminal_seen
     }
 
     fn finish(&self) -> AuditResult {
-        if let Some((usage, quality)) = self.usage {
-            return AuditResult {
-                model: self.model.clone(),
-                usage: Some(usage),
-                quality,
-                metering_error: None,
-            };
-        }
-        // A body that never framed as SSE: extract the token facts from the
-        // same bounded buffer as a complete non-streaming JSON body.
-        if !self.oversized {
-            if let Some(result) = json_body_audit(&self.event_buf) {
-                return result;
-            }
-        }
         AuditResult {
             model: self.model.clone(),
-            usage: None,
-            quality: AccountingQuality::Unavailable,
-            metering_error: match (self.oversized, self.usage_malformed) {
-                (true, _) => Some(MeteringError::EventTooLarge),
-                (false, true) => Some(MeteringError::MalformedUsage),
-                (false, false) => Some(MeteringError::MissingUsage),
+            usage: self.usage.map(|(usage, _)| usage),
+            quality: self
+                .usage
+                .map(|(_, quality)| quality)
+                .unwrap_or(AccountingQuality::Unavailable),
+            metering_error: match &self.usage {
+                Some(_) => None,
+                None if self.oversized => Some(MeteringError::EventTooLarge),
+                None if self.usage_malformed => Some(MeteringError::MalformedUsage),
+                None => Some(MeteringError::MissingUsage),
             },
         }
     }
 }
 
-/// Best-effort extraction of the token facts from a complete non-streaming JSON
-/// Responses body held in `body` (the same bounded event buffer of the SSE
-/// parser). Returns `None` only when the body is not complete JSON, so no usage
-/// exists to extract. Mirrors the previous separate JSON parser semantics:
-/// usage from the top-level `usage` object, model from the top-level `model`,
-/// and missing counters stay missing (never disguised as 0).
-fn json_body_audit(body: &[u8]) -> Option<AuditResult> {
-    let root = serde_json::from_slice::<serde_json::Value>(body).ok()?;
-    let root = root.as_object()?;
-    let model = root
-        .get("model")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
-    let result = match root.get("usage") {
-        None | Some(serde_json::Value::Null) => AuditResult {
-            model,
-            metering_error: Some(MeteringError::MissingUsage),
-            quality: AccountingQuality::Unavailable,
-            ..AuditResult::default()
-        },
-        Some(usage) if usage.is_object() => {
-            let (usage, quality) = canonicalize(extract_raw_usage(usage));
-            AuditResult {
-                model,
-                usage: Some(usage),
-                quality,
-                metering_error: None,
-            }
-        }
-        Some(_) => AuditResult {
-            model,
-            metering_error: Some(MeteringError::MalformedUsage),
-            quality: AccountingQuality::Unavailable,
-            ..AuditResult::default()
-        },
-    };
-    Some(result)
+/// Bounded side-band observer for a non-streaming (`application/json`) response
+/// body. Buffers at most `cap` bytes; once exceeded the body is marked
+/// overflowed and never accumulated. `finish()` returns the token counts only
+/// when the buffered body is complete JSON within the cap.
+pub(crate) struct JsonUsageParser {
+    buf: Vec<u8>,
+    cap: usize,
+    overflowed: bool,
 }
 
-/// Whether the buffered non-streaming body carries the `incomplete` lifecycle
-/// marker: the top-level Responses `status` (ResponseStatus) is exactly
-/// `incomplete`. A separate `incomplete_details` object is context, not
-/// lifecycle authority. A body that is not complete JSON is not marked
-/// incomplete.
-fn json_body_incomplete(body: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|root| {
-            root.as_object().and_then(|obj| {
-                obj.get("status")
-                    .and_then(serde_json::Value::as_str)
-                    .map(|status| status == "incomplete")
+impl JsonUsageParser {
+    fn new(cap: usize) -> Self {
+        JsonUsageParser {
+            buf: Vec::with_capacity(cap.min(4096)),
+            cap,
+            overflowed: false,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        if self.overflowed {
+            return;
+        }
+        let remaining = self.cap - self.buf.len();
+        if chunk.len() <= remaining {
+            self.buf.extend_from_slice(chunk);
+        } else {
+            self.buf.extend_from_slice(&chunk[..remaining]);
+            self.buf.clear();
+            self.overflowed = true;
+        }
+    }
+
+    /// Whether the buffered non-streaming body carries the `incomplete` lifecycle
+    /// marker: the top-level Responses `status` (ResponseStatus) is exactly
+    /// `incomplete`. A separate `incomplete_details` object is context, not
+    /// lifecycle authority. A body that overflowed or is not complete JSON
+    /// within the cap is not marked incomplete.
+    fn incomplete(&self) -> bool {
+        if self.overflowed {
+            return false;
+        }
+        serde_json::from_slice::<serde_json::Value>(&self.buf)
+            .ok()
+            .and_then(|root| {
+                root.as_object().and_then(|obj| {
+                    obj.get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|status| status == "incomplete")
+                })
             })
-        })
-        .unwrap_or(false)
+            .unwrap_or(false)
+    }
+
+    /// Whether the observer captured a complete non-streaming JSON body within
+    /// the cap: such a body is inherently terminal once fully received. A body
+    /// that overflowed the cap or is not complete JSON is not terminal.
+    fn terminal_seen(&self) -> bool {
+        if self.overflowed {
+            return false;
+        }
+        serde_json::from_slice::<serde_json::Value>(&self.buf).is_ok()
+    }
+
+    fn finish(&self) -> AuditResult {
+        if self.overflowed {
+            return AuditResult {
+                metering_error: Some(MeteringError::MissingUsage),
+                quality: AccountingQuality::Unavailable,
+                ..AuditResult::default()
+            };
+        }
+        let Ok(root) = serde_json::from_slice::<serde_json::Value>(&self.buf) else {
+            return AuditResult {
+                metering_error: Some(MeteringError::MissingUsage),
+                quality: AccountingQuality::Unavailable,
+                ..AuditResult::default()
+            };
+        };
+        let Some(root) = root.as_object() else {
+            return AuditResult {
+                metering_error: Some(MeteringError::MissingUsage),
+                quality: AccountingQuality::Unavailable,
+                ..AuditResult::default()
+            };
+        };
+        let model = root
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        match root.get("usage") {
+            None | Some(serde_json::Value::Null) => AuditResult {
+                model,
+                metering_error: Some(MeteringError::MissingUsage),
+                quality: AccountingQuality::Unavailable,
+                ..AuditResult::default()
+            },
+            Some(usage) if usage.is_object() => {
+                let (usage, quality) = canonicalize(extract_raw_usage(usage));
+                AuditResult {
+                    model,
+                    usage: Some(usage),
+                    quality,
+                    metering_error: None,
+                }
+            }
+            Some(_) => AuditResult {
+                model,
+                metering_error: Some(MeteringError::MalformedUsage),
+                quality: AccountingQuality::Unavailable,
+                ..AuditResult::default()
+            },
+        }
+    }
 }
 
 /// Raw counters exactly as reported upstream; missing fields stay missing.

@@ -6,9 +6,14 @@ This project selectively ports and adapts compatible building blocks from the
 independent Codex gateway [ariga39/orihsus](https://github.com/ariga39/orihsus)
 at the pinned revision `7285dd5c6a7ec5f1c0e521c6ee71f70e659d6220`:
 
-- `StreamUsageParser` / `SseUsageParser` (the streaming SSE usage extractor,
-  with its non-streaming JSON fallback) are adapted from `src/gateway.rs`
-  (lines around 2261, 2294, and 2336 respectively).
+- `StreamUsageParser`, `SseUsageParser`, and `JsonUsageParser` are adapted
+  directly from `src/gateway.rs` (lines around 2261, 2294, and 2336
+  respectively). The combination that feeds both bounded observers over the
+  same response stream and selects the grounded terminal result is a local
+  composition on top of those adapted parser pieces, not an upstream feature:
+  orihsus selects a single parser by content type, whereas debitmetre observes
+  SSE and non-streaming JSON simultaneously because real Codex responses can be
+  SSE-framed under a JSON Content-Type.
 - The bounded single-writer JSONL audit writer is adapted from `src/audit.rs`
   (lines around 291, 504, and 527 respectively).
 - `DropNotifyStream` and its response-pump select pattern (client-cancel

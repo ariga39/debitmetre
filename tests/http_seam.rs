@@ -384,6 +384,99 @@ async fn json_labeled_sse_response_is_forwarded_unchanged_and_records_known_usag
     assert_eq!(usage["total"], 17);
 }
 
+/// A synthetic non-streaming Responses JSON body that contains a blank line
+/// (`\n\n`) as insignificant JSON whitespace between fields (issue #20 PR
+/// review): a valid JSON document must not be misread as an SSE stream just
+/// because it happens to contain a blank line. Token counts are the known ones
+/// from `STREAMING_RESPONSE_FIXTURE`: input_total=12, cache_read=4,
+/// cache_write=2, output_total=5, reasoning=2, total=17, so uncached = 6 and
+/// the accounting_quality is `complete`.
+const BLANKLINE_JSON_RESPONSE_FIXTURE: &str = "{\n  \"id\": \"resp-synthetic-blankline\",\n  \"object\": \"response\",\n  \"model\": \"synthetic-model-001\",\n\n  \"usage\": {\n    \"input_tokens\": 12,\n    \"input_tokens_details\": {\n      \"cached_tokens\": 4,\n      \"cache_write_tokens\": 2\n    },\n    \"output_tokens\": 5,\n    \"output_tokens_details\": {\n      \"reasoning_tokens\": 2\n    },\n    \"total_tokens\": 17\n  }\n}";
+
+#[tokio::test]
+async fn genuine_json_with_blank_line_whitespace_is_forwarded_and_records_known_usage() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                "x-codex-semantic".to_string(),
+                "blankline-json-semantic-01".to_string(),
+            ),
+        ],
+        body: BLANKLINE_JSON_RESPONSE_FIXTURE.as_bytes().to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-semantic")
+            .and_then(|v| v.to_str().ok()),
+        Some("blankline-json-semantic-01"),
+        "caller-visible upstream headers preserved"
+    );
+    assert_eq!(
+        response
+            .bytes()
+            .await
+            .expect("gateway response body")
+            .as_ref(),
+        BLANKLINE_JSON_RESPONSE_FIXTURE.as_bytes(),
+        "caller-visible response bytes are byte-for-byte the upstream JSON body"
+    );
+
+    let record = wait_for_jsonl_record(&usage_file).await;
+    assert_eq!(
+        read_jsonl(&usage_file).len(),
+        1,
+        "exactly one audit record per accepted request"
+    );
+    assert_eq!(record["kind"], "request");
+    assert_eq!(record["operation"], "response");
+    assert_eq!(record["machine_id"], "machine-a");
+    assert_eq!(record["upstream_status"], 200);
+    assert_eq!(record["outcome"], "completed");
+    assert_eq!(record["model"], "synthetic-model-001");
+    assert_eq!(record["accounting_quality"], "complete");
+    assert!(record["metering_error"].is_null());
+
+    let usage = &record["usage"];
+    assert_eq!(usage["input_total"], 12);
+    assert_eq!(usage["uncached"], 6);
+    assert_eq!(usage["cache_read"], 4);
+    assert_eq!(usage["cache_write"], 2);
+    assert_eq!(usage["output_total"], 5);
+    assert_eq!(usage["reasoning"], 2);
+    assert_eq!(usage["total"], 17);
+}
+
 /// A synthetic non-streaming compact response (DESIGN.md §11: the real compact
 /// response shape is pending PoC, so this uses a conservative JSON body) with
 /// only `input_total` and `output_total` present: the absent counters must stay
