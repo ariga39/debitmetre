@@ -47,7 +47,7 @@ The `machine_keys` table maps the **SHA-256 digest** of each machine's meter key
 machine id. Compute the digest for a meter key once, then paste the lowercase hex output:
 
 ```sh
-printf '%s' 'your-meter-key' | sha256sum
+printf '%s' 'test-meter-key-machine-a' | sha256sum
 ```
 
 ```toml

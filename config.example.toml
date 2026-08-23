@@ -3,7 +3,7 @@
 # The machine_keys table maps the SHA-256 digest (lowercase hex) of each machine's
 # meter key to a stable machine id. Compute a digest for a real key with:
 #
-#   printf '%s' 'your-meter-key' | sha256sum
+#   printf '%s' 'test-meter-key-machine-a' | sha256sum
 #
 # Invalid or unreadable configuration makes the process exit non-zero before serving.
 
