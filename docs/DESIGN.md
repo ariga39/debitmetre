@@ -93,7 +93,9 @@ Request headers follow an explicit stripping policy that prioritizes compatibili
   a transparent tee would require either blocking, dropping, or unbounded buffering of the side channel,
   plus separate cancellation coordination between the response pump and the observer. The pinned
   orihsus bounded SSE parser (`src/gateway.rs`) is adapted instead, with a tiny bounded terminal-name
-  observation of an oversized event's prefix so an oversized terminal event keeps its terminal outcome.
+  observation: an oversized discarded event's already-buffered prefix is scanned at its completed delimiter
+  for a line-start `event:` field (last field wins), so an oversized terminal event keeps its terminal
+  outcome while a partial event truncated before the delimiter is never delivered.
 
 ## 5. Audit (canonical request audit)
 

@@ -169,8 +169,9 @@ pub(crate) struct AuditResult {
 /// (pinned codex-cli 0.149.0, `codex-rs/codex-api/src/sse/responses.rs`), so a
 /// JSON-labeled body can still be SSE-framed. A body is metered as SSE only when
 /// a terminal `response.completed` / `response.incomplete` event is actually
-/// observed (including one recognized from its bounded prefix when oversized);
-/// otherwise the complete non-streaming JSON body owns the result. The lifecycle
+/// observed (including one recognized from its line-start `event:` field at the
+/// completed delimiter when oversized); otherwise the complete non-streaming JSON
+/// body owns the result. The lifecycle
 /// is terminal when the SSE observer saw a supported terminal event or the body
 /// never framed as SSE and reached clean EOF — a completed non-streaming body
 /// whose bounded metering parse failed stays `completed`, never
@@ -196,8 +197,9 @@ impl StreamUsageParser {
 
     /// Finalize parsing after the stream reaches its terminal state: the SSE
     /// observer owns the result when it observed a supported terminal event
-    /// (including an oversized one recognized from its bounded prefix);
-    /// otherwise the non-streaming JSON body owns it.
+    /// (including an oversized one recognized from its line-start `event:` field
+    /// at the completed delimiter); otherwise the non-streaming JSON body owns
+    /// it.
     pub(crate) fn finish(&self) -> AuditResult {
         if self.sse.terminal_seen() || self.sse.oversized_terminal_seen() {
             self.sse.finish()
@@ -245,11 +247,11 @@ pub(crate) struct SseUsageParser {
     /// Whether at least one SSE data event was actually observed (a real SSE
     /// stream), as opposed to a body that never framed as SSE.
     saw_event: bool,
-    /// Whether an oversized (discarded) event's bounded prefix carried the
-    /// `response.completed` terminal name.
+    /// Whether a discarded oversized event completed at its delimiter with a
+    /// line-start `event:` field naming `response.completed`.
     oversized_terminal_completed: bool,
-    /// Whether an oversized (discarded) event's bounded prefix carried the
-    /// `response.incomplete` terminal name.
+    /// Whether a discarded oversized event completed at its delimiter with a
+    /// line-start `event:` field naming `response.incomplete`.
     oversized_terminal_incomplete: bool,
     model: Option<String>,
     usage: Option<(Usage, AccountingQuality)>,
@@ -290,18 +292,21 @@ impl SseUsageParser {
                 if !self.discarding {
                     self.consume_event(&event);
                 } else {
-                    // Bounded terminal-name observation of an oversized event:
-                    // the prefix already buffered within `event_cap` is scanned
-                    // for the supported terminal names, so an oversized terminal
-                    // event keeps its terminal outcome (DESIGN.md §4.1).
+                    // Bounded terminal-name observation of an oversized event,
+                    // only at its completed delimiter, from line-start `event:`
+                    // fields (last field wins). A partial event is never a
+                    // delivered terminal (DESIGN.md §4.1).
                     if prefix_has_sse_framing(&event) {
                         self.saw_event = true;
                     }
-                    if prefix_has_terminal(&event, b"response.completed") {
-                        self.oversized_terminal_completed = true;
-                    }
-                    if prefix_has_terminal(&event, b"response.incomplete") {
-                        self.oversized_terminal_incomplete = true;
+                    match event_field_terminal(&event) {
+                        Some(OversizedTerminalKind::Completed) => {
+                            self.oversized_terminal_completed = true;
+                        }
+                        Some(OversizedTerminalKind::Incomplete) => {
+                            self.oversized_terminal_incomplete = true;
+                        }
+                        None => {}
                     }
                 }
                 self.discarding = false;
@@ -366,20 +371,17 @@ impl SseUsageParser {
         self.terminal_seen
     }
 
-    /// Whether an oversized (discarded) event was a supported terminal event,
-    /// recognized from its bounded prefix. Bounded: scans at most `event_cap`
-    /// bytes, never re-buffering a whole event.
+    /// Whether a discarded oversized event completed at its delimiter as a
+    /// supported terminal event, recognized from a line-start `event:` field in
+    /// its bounded prefix. A partial event truncated at EOF before the delimiter
+    /// is not delivered and is never reported here. Bounded: scans at most
+    /// `event_cap` bytes, never re-buffering a whole event.
     fn oversized_terminal_seen(&self) -> bool {
-        self.oversized_terminal_completed
-            || self.oversized_terminal_incomplete
-            || (self.discarding
-                && (prefix_has_terminal(&self.event_buf, b"response.completed")
-                    || prefix_has_terminal(&self.event_buf, b"response.incomplete")))
+        self.oversized_terminal_completed || self.oversized_terminal_incomplete
     }
 
     fn oversized_terminal_incomplete(&self) -> bool {
         self.oversized_terminal_incomplete
-            || (self.discarding && prefix_has_terminal(&self.event_buf, b"response.incomplete"))
     }
 
     /// Whether the body framed as an SSE stream: at least one SSE data event was
@@ -427,10 +429,46 @@ fn prefix_has_sse_framing(bytes: &[u8]) -> bool {
     })
 }
 
-/// Whether `bytes` contains the fixed `name` byte substring. Used to recognize a
-/// supported terminal SSE event name in a bounded prefix.
-fn prefix_has_terminal(bytes: &[u8], name: &[u8]) -> bool {
-    bytes.windows(name.len()).any(|window| window == name)
+/// The supported terminal kind named by the last line-start `event:` field in a
+/// bounded SSE-event prefix, per SSE field semantics (the last `event:` field
+/// wins). Terminal text inside `data:`, `id:`, `retry:`, or arbitrary bytes is
+/// never recognized. Returns `None` when the last `event:` field is not a
+/// supported terminal or there is no `event:` field.
+fn event_field_terminal(bytes: &[u8]) -> Option<OversizedTerminalKind> {
+    let mut terminal = None;
+    for line in bytes.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let Some(value) = line.strip_prefix(b"event:") else {
+            continue;
+        };
+        let value = trim_ascii_space(value);
+        terminal = match value {
+            b"response.completed" => Some(OversizedTerminalKind::Completed),
+            b"response.incomplete" => Some(OversizedTerminalKind::Incomplete),
+            _ => None,
+        };
+    }
+    terminal
+}
+
+fn trim_ascii_space(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(start, |i| i + 1);
+    &bytes[start..end]
+}
+
+/// A supported terminal SSE event kind recognized from a line-start `event:`
+/// field of a discarded oversized event (see [`event_field_terminal`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OversizedTerminalKind {
+    Completed,
+    Incomplete,
 }
 
 /// Bounded side-band observer for a non-streaming (`application/json`) response
