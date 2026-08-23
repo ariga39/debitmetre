@@ -12,6 +12,7 @@ use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 
 pub mod config;
+pub mod summary;
 mod usage;
 
 use usage::{AccountingQuality, AuditRecord, Operation, Outcome, StreamUsageParser};

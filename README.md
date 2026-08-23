@@ -41,6 +41,22 @@ debitmetre --config /etc/debitmetre/config.toml
 Operational logs go to stderr (suitable for a terminal, journald, or systemd) and never print
 meter keys or request/response bodies.
 
+### View accumulated usage
+
+Run one local command with the same configuration to see the recorded token facts
+accumulated in the configured usage file, grouped by machine and model:
+
+```sh
+debitmetre summary --config /etc/debitmetre/config.toml
+```
+
+The output is a fixed-width table (machine, model, record count, then input,
+uncached, cache-read, cache-write, output, reasoning, and total tokens). Totals
+sum only the values actually recorded; a counter that was never recorded shows
+`-` and is never invented as 0, and no prices are computed. An unfinished
+trailing line left by a process crash is ignored with a warning while earlier
+complete records are still summarized. Warnings go to stderr.
+
 ### Configuration
 
 The `machine_keys` table maps the **SHA-256 digest** of each machine's meter key to a stable

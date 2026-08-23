@@ -19,7 +19,7 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Bounded audit queue capacity (DESIGN.md §8). At most this many records wait
@@ -55,7 +55,7 @@ const AUDIT_DROPPED: &str = "debitmetre: audit_dropped: usage record dropped; th
 full (further drops are only counted)";
 
 /// Operation category of an accepted request (DESIGN.md §5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Operation {
     Response,
@@ -63,7 +63,7 @@ pub(crate) enum Operation {
 }
 
 /// Terminal-state classification of a request lifecycle (DESIGN.md §5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Outcome {
     Completed,
@@ -75,7 +75,7 @@ pub(crate) enum Outcome {
 }
 
 /// Marker of how trustworthy a usage datum is (DESIGN.md §4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AccountingQuality {
     Complete,
@@ -87,7 +87,7 @@ pub(crate) enum AccountingQuality {
 
 /// Why usage could not be recorded (DESIGN.md §5). `null` when usage is
 /// recorded normally or when a non-success response made metering inapplicable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MeteringError {
     MissingUsage,
@@ -97,7 +97,7 @@ pub(crate) enum MeteringError {
 
 /// Canonical token counters (DESIGN.md §4). Missing fields stay missing (JSON
 /// `null`); a missing value is never disguised as 0.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Usage {
     pub(crate) input_total: Option<u64>,
     pub(crate) uncached: Option<u64>,
@@ -110,11 +110,12 @@ pub(crate) struct Usage {
 
 /// One canonical JSONL audit line (DESIGN.md §5). Only allowlisted fields;
 /// bodies, credentials, meter keys, raw headers, and raw usage JSON never enter
-/// a record.
-#[derive(Debug, Clone, Serialize)]
+/// a record. Also deserializable so the local `summary` command can read the
+/// recorded facts back from the usage file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AuditRecord {
     pub(crate) schema_version: u8,
-    pub(crate) kind: &'static str,
+    pub(crate) kind: String,
     pub(crate) event_id: String,
     pub(crate) timestamp: String,
     pub(crate) machine_id: String,
@@ -134,7 +135,7 @@ impl AuditRecord {
     pub(crate) fn new(machine_id: String, operation: Operation) -> Self {
         AuditRecord {
             schema_version: SCHEMA_VERSION,
-            kind: KIND,
+            kind: KIND.to_string(),
             event_id: Uuid::new_v4().to_string(),
             timestamp: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
             machine_id,
