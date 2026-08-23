@@ -1,0 +1,1250 @@
+use std::collections::BTreeMap;
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use axum::body::{Body, Bytes};
+use axum::extract::{Request, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{any, post};
+use axum::Router;
+use futures_util::{Stream, StreamExt};
+use reqwest::header::{HeaderMap, HeaderValue};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+
+use debitmetre::Gateway;
+
+/// SHA-256 digest of the synthetic meter key `test-meter-key-machine-a`,
+/// independently precomputed with `sha256sum` and OpenSSL `dgst -sha256`
+/// (both tools agree); the gateway hashes the presented key at runtime.
+const TEST_METER_KEY_DIGEST: &str =
+    "82805ec33616c4aa802f141d3703fb17213fd8ced358f3a62348d8cf6e1ce051";
+
+#[derive(Clone, Default)]
+struct FakeUpstream {
+    captured: Arc<Mutex<Vec<CapturedRequest>>>,
+    received_body: Arc<Mutex<Option<Vec<u8>>>>,
+    queue: Arc<Mutex<Vec<CannedResponse>>>,
+    redirect_hits: Arc<Mutex<usize>>,
+    dropped: Arc<Mutex<bool>>,
+}
+
+#[derive(Default)]
+struct CannedResponse {
+    status: StatusCode,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+#[derive(Default)]
+struct CapturedRequest {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+    headers: Vec<(String, String)>,
+    query: Option<String>,
+}
+
+async fn fake_upstream_handler(
+    State(upstream): State<FakeUpstream>,
+    req: Request<Body>,
+) -> Response {
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().map(|q| q.to_string());
+    let headers = req
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value.to_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+        .await
+        .expect("fake upstream must read request body");
+    upstream.captured.lock().unwrap().push(CapturedRequest {
+        method,
+        path,
+        body: bytes.to_vec(),
+        headers,
+        query,
+    });
+    (StatusCode::CREATED, "opaque-upstream-body-01").into_response()
+}
+
+async fn spawn(app: Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral listener");
+    let addr = listener.local_addr().expect("resolved local address");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server runs");
+    });
+    format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn responses_route_authenticates_valid_key_and_forwards_to_fake_upstream() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(fake_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response
+            .bytes()
+            .await
+            .expect("gateway response body")
+            .as_ref(),
+        &b"opaque-upstream-body-01"[..]
+    );
+
+    let captured = upstream
+        .captured
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("fake upstream received one request");
+    assert_eq!(captured.method, "POST");
+    assert_eq!(captured.path, "/responses");
+    assert_eq!(captured.body, b"opaque-request-body-42");
+}
+
+fn raw_request_head(extra_header_bytes: &[u8]) -> Vec<u8> {
+    let mut head =
+        b"POST /v1/responses HTTP/1.1\r\nHost: gateway\r\nConnection: close\r\n".to_vec();
+    head.extend_from_slice(extra_header_bytes);
+    head.extend_from_slice(b"Content-Length: 100000\r\n\r\n");
+    head
+}
+
+async fn raw_request_with_incomplete_body(addr: SocketAddr, request_head: Vec<u8>) -> Vec<u8> {
+    let mut stream = TcpStream::connect(addr).await.expect("connect to gateway");
+    stream
+        .write_all(&request_head)
+        .await
+        .expect("write request head");
+    stream
+        .write_all(b"partial-body-")
+        .await
+        .expect("write partial body");
+
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .expect("gateway must answer without the full body")
+            .expect("read response byte");
+        if n == 0 {
+            break;
+        }
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n") {
+            break;
+        }
+    }
+    buf
+}
+
+#[tokio::test]
+async fn invalid_x_meter_key_forms_are_rejected_with_uniform_401_before_upstream() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(fake_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+    let gateway_addr: SocketAddr = gateway_url
+        .trim_start_matches("http://")
+        .parse()
+        .expect("gateway socket addr");
+
+    let client = reqwest::Client::new();
+
+    let mut duplicate_headers = HeaderMap::new();
+    duplicate_headers.append(
+        "x-meter-key",
+        HeaderValue::from_static("test-meter-key-machine-a"),
+    );
+    duplicate_headers.append(
+        "x-meter-key",
+        HeaderValue::from_static("intruder-duplicate"),
+    );
+
+    let mut malformed_headers = HeaderMap::new();
+    malformed_headers.append(
+        "x-meter-key",
+        HeaderValue::from_bytes(&[0xff, 0xfe]).expect("non-utf8 header value"),
+    );
+
+    let mut unknown_headers = HeaderMap::new();
+    unknown_headers.append("x-meter-key", HeaderValue::from_static("intruder-unknown"));
+
+    let forms: [(&str, Option<HeaderMap>); 4] = [
+        ("missing", None),
+        ("duplicate", Some(duplicate_headers)),
+        ("malformed", Some(malformed_headers)),
+        ("unknown", Some(unknown_headers)),
+    ];
+
+    for (name, headers) in forms {
+        let mut request = client.post(format!("{gateway_url}/v1/responses"));
+        if let Some(headers) = headers {
+            request = request.headers(headers);
+        }
+        let response = request
+            .body("opaque-request-body-42")
+            .send()
+            .await
+            .unwrap_or_else(|err| panic!("{name}: caller reaches gateway: {err}"));
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{name} status");
+        assert_eq!(
+            response.bytes().await.expect("read 401 body").as_ref(),
+            &b"unauthorized"[..],
+            "{name} body"
+        );
+    }
+
+    for (name, request_head) in [
+        ("missing", raw_request_head(b"")),
+        (
+            "duplicate",
+            raw_request_head(
+                b"X-Meter-Key: test-meter-key-machine-a\r\nX-Meter-Key: intruder-duplicate\r\n",
+            ),
+        ),
+        ("malformed", raw_request_head(b"X-Meter-Key: \xff\xfe\r\n")),
+        (
+            "unknown",
+            raw_request_head(b"X-Meter-Key: intruder-unknown\r\n"),
+        ),
+    ] {
+        let status_line = raw_request_with_incomplete_body(gateway_addr, request_head).await;
+        assert!(
+            status_line.starts_with(b"HTTP/1.1 401"),
+            "{name}: uniform 401 without consuming the body, got {status_line:?}"
+        );
+    }
+
+    assert!(
+        upstream.captured.lock().unwrap().is_empty(),
+        "fake upstream must observe no request for any invalid form"
+    );
+}
+
+#[tokio::test]
+async fn closed_route_set_reaches_upstream_only_for_known_post_paths() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(fake_upstream_handler))
+        .route("/responses/compact", post(fake_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let valid_key = "test-meter-key-machine-a";
+
+    for (path, body) in [
+        ("/v1/responses", "opaque-request-body-42"),
+        ("/v1/responses/compact", "opaque-compact-body-07"),
+    ] {
+        let response = client
+            .post(format!("{gateway_url}{path}"))
+            .header("x-meter-key", valid_key)
+            .body(body)
+            .send()
+            .await
+            .unwrap_or_else(|err| panic!("{path}: caller reaches gateway: {err}"));
+
+        assert_eq!(response.status(), StatusCode::CREATED, "{path} status");
+        assert_eq!(
+            response.bytes().await.expect("read upstream body").as_ref(),
+            &b"opaque-upstream-body-01"[..],
+            "{path} body"
+        );
+    }
+
+    {
+        let captured = upstream.captured.lock().unwrap();
+        assert_eq!(captured.len(), 2, "both known paths reach upstream");
+        assert_eq!(captured[0].method, "POST");
+        assert_eq!(captured[0].path, "/responses");
+        assert_eq!(captured[0].body, b"opaque-request-body-42");
+        assert_eq!(captured[1].method, "POST");
+        assert_eq!(captured[1].path, "/responses/compact");
+        assert_eq!(captured[1].body, b"opaque-compact-body-07");
+    }
+
+    for (method, path) in [
+        (reqwest::Method::GET, "/v1/responses"),
+        (reqwest::Method::DELETE, "/v1/responses/compact"),
+    ] {
+        let response = client
+            .request(method.clone(), format!("{gateway_url}{path}"))
+            .header("x-meter-key", valid_key)
+            .send()
+            .await
+            .unwrap_or_else(|err| panic!("{path}: caller reaches gateway: {err}"));
+
+        assert_eq!(
+            response.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {path} status"
+        );
+    }
+
+    for path in ["/v1/unknown", "/v1/responses/other", "/nope"] {
+        let response = client
+            .post(format!("{gateway_url}{path}"))
+            .header("x-meter-key", valid_key)
+            .body("opaque-request-body-42")
+            .send()
+            .await
+            .unwrap_or_else(|err| panic!("{path}: caller reaches gateway: {err}"));
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path} status");
+    }
+
+    assert_eq!(
+        upstream.captured.lock().unwrap().len(),
+        2,
+        "wrong method and unknown path never reach upstream"
+    );
+}
+
+async fn raw_post_complete(addr: SocketAddr, request_head: Vec<u8>, body: &[u8]) -> Vec<u8> {
+    let mut stream = TcpStream::connect(addr).await.expect("connect to gateway");
+    stream
+        .write_all(&request_head)
+        .await
+        .expect("write request head");
+    stream.write_all(body).await.expect("write request body");
+
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .expect("read response")
+            .expect("read response byte");
+        if n == 0 {
+            break;
+        }
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n") {
+            break;
+        }
+    }
+    buf
+}
+
+#[tokio::test]
+async fn request_header_policy_strips_privacy_and_hop_headers_before_upstream() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(fake_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+    let gateway_addr: SocketAddr = gateway_url
+        .trim_start_matches("http://")
+        .parse()
+        .expect("gateway socket addr");
+
+    let request_head = b"POST /v1/responses HTTP/1.1\r\n\
+Host: caller-host.example\r\n\
+Connection: X-Synthetic-Hop\r\n\
+X-Synthetic-Hop: hop-value\r\n\
+Cookie: session=secret\r\n\
+Keep-Alive: timeout=5\r\n\
+Forwarded: for=192.0.2.1\r\n\
+Via: 1.0 proxy\r\n\
+X-Forwarded-For: 192.0.2.1\r\n\
+X-Forwarded-Host: example.com\r\n\
+X-Forwarded-Proto: https\r\n\
+X-Forwarded-Port: 443\r\n\
+X-Forwarded-Prefix: /codex\r\n\
+X-Forwarded-Client-Cert: synthetic-client-cert\r\n\
+X-Real-IP: 192.0.2.1\r\n\
+TE: trailers\r\n\
+Upgrade: h2c\r\n\
+Proxy-Connection: keep-alive\r\n\
+Proxy-Authenticate: Basic realm=gw\r\n\
+Proxy-Authorization: Basic c3ludGhldGlj\r\n\
+X-Meter-Key: test-meter-key-machine-a\r\n\
+Authorization: Bearer clearly-invalid-synthetic-token\r\n\
+ChatGPT-Account-ID: synthetic-account-01\r\n\
+X-Codex-Custom: synthetic-value\r\n\
+Content-Length: 8\r\n\
+\r\n"
+        .to_vec();
+
+    let status_line = raw_post_complete(gateway_addr, request_head, b"opaque-1").await;
+    assert!(
+        status_line.starts_with(b"HTTP/1.1 201"),
+        "valid key request reaches upstream, got {status_line:?}"
+    );
+
+    let captured = upstream
+        .captured
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("fake upstream observed one request");
+    let upstream_headers: BTreeMap<String, String> = captured.headers.into_iter().collect();
+
+    assert_eq!(
+        upstream_headers.get("authorization").map(String::as_str),
+        Some("Bearer clearly-invalid-synthetic-token"),
+        "Authorization must reach upstream uninterpreted"
+    );
+    assert_eq!(
+        upstream_headers
+            .get("chatgpt-account-id")
+            .map(String::as_str),
+        Some("synthetic-account-01"),
+        "ChatGPT-Account-ID must reach upstream"
+    );
+    assert_eq!(
+        upstream_headers.get("x-codex-custom").map(String::as_str),
+        Some("synthetic-value"),
+        "unknown Codex header must reach upstream"
+    );
+
+    for name in [
+        "connection",
+        "x-synthetic-hop",
+        "cookie",
+        "x-meter-key",
+        "keep-alive",
+        "forwarded",
+        "via",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-forwarded-port",
+        "x-forwarded-prefix",
+        "x-forwarded-client-cert",
+        "x-real-ip",
+        "te",
+        "upgrade",
+        "proxy-connection",
+        "proxy-authenticate",
+        "proxy-authorization",
+    ] {
+        assert!(
+            !upstream_headers.contains_key(name),
+            "{name} must be stripped before upstream"
+        );
+    }
+
+    assert_ne!(
+        upstream_headers.get("host").map(String::as_str),
+        Some("caller-host.example"),
+        "caller Host must not reach upstream"
+    );
+}
+
+fn event_for_sentinel(rest: &[u8]) -> Option<(usize, &'static [u8])> {
+    let pos = rest.windows(3).position(|w| w == b"|A|" || w == b"|B|")?;
+    let event = if &rest[pos..pos + 3] == b"|A|" {
+        b"data: A\n\n"
+    } else {
+        b"data: B\n\n"
+    };
+    Some((pos, event))
+}
+
+async fn streaming_upstream_handler(
+    State(upstream): State<FakeUpstream>,
+    req: Request<Body>,
+) -> Response {
+    let mut request_stream = req.into_body().into_data_stream();
+    let store = upstream.received_body.clone();
+    let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(8);
+    tokio::spawn(async move {
+        let mut received: Vec<u8> = Vec::new();
+        let mut scan = 0usize;
+        while let Some(chunk) = request_stream.next().await {
+            let Ok(bytes) = chunk else { break };
+            received.extend_from_slice(&bytes);
+            while let Some((rel, event)) = event_for_sentinel(&received[scan..]) {
+                scan += rel + 3;
+                if tx.send(Ok(Bytes::from_static(event))).await.is_err() {
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(Ok(Bytes::from_static(b"data: done\n\n"))).await;
+        *store.lock().unwrap() = Some(received);
+    });
+    Response::new(axum::body::Body::from_stream(ReceiverStream::new(rx)))
+}
+
+async fn read_response_until(
+    stream: &mut (impl Stream<Item = Result<Bytes, reqwest::Error>> + Unpin),
+    body: &mut Vec<u8>,
+    needle: &[u8],
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !body.windows(needle.len()).any(|w| w == needle) {
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for {needle:?}; response body so far: {:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        let chunk = tokio::time::timeout(deadline - tokio::time::Instant::now(), stream.next())
+            .await
+            .expect("read response chunk")
+            .expect("response body still open")
+            .expect("response body chunk");
+        body.extend_from_slice(&chunk);
+    }
+}
+
+#[tokio::test]
+async fn opaque_bidirectional_streaming_relays_progress_in_order() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(streaming_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(8);
+    let request_body = reqwest::Body::wrap_stream(ReceiverStream::new(rx));
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        client
+            .post(format!("{gateway_url}/v1/responses"))
+            .header("x-meter-key", "test-meter-key-machine-a")
+            .body(request_body)
+            .send(),
+    )
+    .await
+    .expect("caller receives gateway response without finishing the request body")
+    .expect("caller reaches gateway");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    tx.send(Ok(Bytes::from_static(b"part-A|A|")))
+        .await
+        .expect("caller streams part A");
+
+    let mut body: Vec<u8> = Vec::new();
+    let mut response_stream = response.bytes_stream();
+    read_response_until(&mut response_stream, &mut body, b"data: A\n\n").await;
+    assert_eq!(
+        body, b"data: A\n\n",
+        "upstream observed request progress and caller observed response progress"
+    );
+
+    tx.send(Ok(Bytes::from_static(b"part-B|B|")))
+        .await
+        .expect("caller streams part B");
+    drop(tx);
+
+    read_response_until(&mut response_stream, &mut body, b"data: done\n\n").await;
+    assert_eq!(
+        body, b"data: A\n\ndata: B\n\ndata: done\n\n",
+        "response bytes remain in order"
+    );
+
+    let received = upstream
+        .received_body
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream read the request body");
+    assert_eq!(
+        received, b"part-A|A|part-B|B|",
+        "request bytes remain in order"
+    );
+}
+
+async fn canned_upstream_handler(
+    State(upstream): State<FakeUpstream>,
+    req: Request<Body>,
+) -> Response {
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let query = req.uri().query().map(|q| q.to_string());
+    let headers = req
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value.to_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+    let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+        .await
+        .expect("fake upstream reads request body");
+    upstream.captured.lock().unwrap().push(CapturedRequest {
+        method,
+        path,
+        body: bytes.to_vec(),
+        headers,
+        query,
+    });
+    let canned = upstream.queue.lock().unwrap().remove(0);
+    let mut builder = Response::builder().status(canned.status);
+    for (name, value) in canned.headers {
+        builder = builder.header(name, value);
+    }
+    builder
+        .body(Body::from(canned.body))
+        .expect("canned response")
+}
+
+async fn redirect_target_handler(State(upstream): State<FakeUpstream>) -> Response {
+    *upstream.redirect_hits.lock().unwrap() += 1;
+    (StatusCode::OK, "redirect-target-hit").into_response()
+}
+
+#[tokio::test]
+async fn upstream_response_semantics_preserved_without_redirect_following() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .route("/responses/compact", post(canned_upstream_handler))
+        .route("/redirect-target", any(redirect_target_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("caller client");
+
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::FOUND,
+        headers: vec![
+            ("location".to_string(), "/redirect-target".to_string()),
+            (
+                "x-codex-semantic".to_string(),
+                "redirect-semantic-01".to_string(),
+            ),
+            ("content-type".to_string(), "text/plain".to_string()),
+            ("connection".to_string(), "X-Synthetic-Hop".to_string()),
+            ("x-synthetic-hop".to_string(), "hop-value".to_string()),
+            ("keep-alive".to_string(), "timeout=5".to_string()),
+        ],
+        body: b"redirect-body-01".to_vec(),
+    });
+
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(
+        *upstream.redirect_hits.lock().unwrap(),
+        0,
+        "redirect target must never be requested"
+    );
+    assert_eq!(
+        response.status(),
+        StatusCode::FOUND,
+        "3xx status passes through"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok()),
+        Some("/redirect-target"),
+        "Location preserved"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-semantic")
+            .and_then(|v| v.to_str().ok()),
+        Some("redirect-semantic-01"),
+        "unknown Codex header preserved"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/plain"),
+        "content-type preserved"
+    );
+    assert!(
+        !response.headers().contains_key("connection"),
+        "connection stripped"
+    );
+    assert!(
+        !response.headers().contains_key("x-synthetic-hop"),
+        "connection-nominated header stripped"
+    );
+    assert!(
+        !response.headers().contains_key("keep-alive"),
+        "hop-by-hop keep-alive stripped"
+    );
+    assert_eq!(
+        response.bytes().await.expect("redirect body").as_ref(),
+        &b"redirect-body-01"[..],
+        "redirect body bytes preserved"
+    );
+
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        headers: vec![
+            ("retry-after".to_string(), "7".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                "x-codex-semantic".to_string(),
+                "rate-limit-semantic-02".to_string(),
+            ),
+        ],
+        body: b"{\"error\":\"opaque-rate-limit\"}".to_vec(),
+    });
+
+    let response = client
+        .post(format!("{gateway_url}/v1/responses/compact"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-compact-body-07")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "429 status passes through"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("7"),
+        "Retry-After preserved"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/json"),
+        "content-type preserved on non-2xx"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-semantic")
+            .and_then(|v| v.to_str().ok()),
+        Some("rate-limit-semantic-02"),
+        "unknown Codex header preserved on non-2xx"
+    );
+    assert_eq!(
+        response.bytes().await.expect("429 body").as_ref(),
+        &b"{\"error\":\"opaque-rate-limit\"}"[..],
+        "429 body bytes preserved"
+    );
+}
+
+#[tokio::test]
+async fn response_header_policy_strips_only_hop_by_hop() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("caller client");
+
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![
+            ("via".to_string(), "1.1 synthetic-via".to_string()),
+            ("forwarded".to_string(), "for=192.0.2.1".to_string()),
+            (
+                "x-meter-upstream".to_string(),
+                "upstream-meter-01".to_string(),
+            ),
+            ("cookie".to_string(), "upstream-cookie=1".to_string()),
+            ("set-cookie".to_string(), "session=synthetic".to_string()),
+            (
+                "x-codex-custom".to_string(),
+                "response-custom-01".to_string(),
+            ),
+            ("connection".to_string(), "X-Response-Hop".to_string()),
+            ("x-response-hop".to_string(), "hop-value".to_string()),
+            ("keep-alive".to_string(), "timeout=5".to_string()),
+            ("proxy-connection".to_string(), "keep-alive".to_string()),
+        ],
+        body: b"opaque-response-body-09".to_vec(),
+    });
+
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    assert_eq!(
+        response.headers().get("via").and_then(|v| v.to_str().ok()),
+        Some("1.1 synthetic-via"),
+        "Via preserved on response (request-only strip name)"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("forwarded")
+            .and_then(|v| v.to_str().ok()),
+        Some("for=192.0.2.1"),
+        "Forwarded preserved on response (request-only strip name)"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-meter-upstream")
+            .and_then(|v| v.to_str().ok()),
+        Some("upstream-meter-01"),
+        "X-Meter-* preserved on response (request-only strip name)"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("cookie")
+            .and_then(|v| v.to_str().ok()),
+        Some("upstream-cookie=1"),
+        "Cookie preserved on response (request-only strip name)"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("set-cookie")
+            .and_then(|v| v.to_str().ok()),
+        Some("session=synthetic"),
+        "Set-Cookie preserved"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-custom")
+            .and_then(|v| v.to_str().ok()),
+        Some("response-custom-01"),
+        "unknown Codex header preserved"
+    );
+
+    assert!(
+        !response.headers().contains_key("connection"),
+        "connection stripped"
+    );
+    assert!(
+        !response.headers().contains_key("x-response-hop"),
+        "Connection-nominated header stripped"
+    );
+    assert!(
+        !response.headers().contains_key("keep-alive"),
+        "hop-by-hop keep-alive stripped"
+    );
+    assert!(
+        !response.headers().contains_key("proxy-connection"),
+        "hop-by-hop proxy-connection stripped"
+    );
+
+    assert_eq!(
+        response.bytes().await.expect("response body").as_ref(),
+        &b"opaque-response-body-09"[..],
+        "response body preserved"
+    );
+}
+
+#[tokio::test]
+async fn missing_authorization_still_reaches_upstream_which_owns_its_401() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::UNAUTHORIZED,
+        headers: vec![
+            (
+                "www-authenticate".to_string(),
+                "Bearer realm=codex".to_string(),
+            ),
+            (
+                "x-codex-semantic".to_string(),
+                "upstream-auth-401".to_string(),
+            ),
+        ],
+        body: b"{\"error\":\"upstream-owned-401\"}".to_vec(),
+    });
+
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "upstream owns its 401 status"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok()),
+        Some("Bearer realm=codex"),
+        "upstream semantic 401 header preserved"
+    );
+    assert_eq!(
+        response.bytes().await.expect("401 body").as_ref(),
+        &b"{\"error\":\"upstream-owned-401\"}"[..],
+        "upstream owns its 401 body"
+    );
+
+    let captured = upstream
+        .captured
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("fake upstream saw the forwarded request");
+    assert_eq!(captured.path, "/responses");
+    assert_eq!(captured.body, b"opaque-request-body-42");
+    assert!(
+        captured
+            .headers
+            .iter()
+            .all(|(name, _)| name != "authorization"),
+        "no Authorization header reaches upstream"
+    );
+}
+
+async fn cancellation_upstream_handler(
+    State(upstream): State<FakeUpstream>,
+    req: Request<Body>,
+) -> Response {
+    let mut request_stream = req.into_body().into_data_stream();
+    let dropped = upstream.dropped.clone();
+    let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(8);
+    tokio::spawn(async move {
+        let mut sent_first = false;
+        loop {
+            match request_stream.next().await {
+                Some(Ok(bytes)) => {
+                    if !sent_first {
+                        sent_first = true;
+                        if tx
+                            .send(Ok(Bytes::from_static(b"data: first\n\n")))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    let _ = bytes;
+                }
+                _ => {
+                    *dropped.lock().unwrap() = true;
+                    return;
+                }
+            }
+        }
+    });
+    Response::new(axum::body::Body::from_stream(ReceiverStream::new(rx)))
+}
+
+async fn read_raw_until(stream: &mut TcpStream, acc: &mut Vec<u8>, needle: &[u8]) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !acc.windows(needle.len()).any(|w| w == needle) {
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for {needle:?}; received so far: {:?}",
+                String::from_utf8_lossy(acc)
+            );
+        }
+        let mut byte = [0u8; 1];
+        let n = tokio::time::timeout(
+            deadline - tokio::time::Instant::now(),
+            stream.read(&mut byte),
+        )
+        .await
+        .expect("read byte")
+        .expect("connection open");
+        if n == 0 {
+            panic!("connection closed waiting for {needle:?}");
+        }
+        acc.extend_from_slice(&byte);
+    }
+}
+
+#[tokio::test]
+async fn transport_failure_returns_safe_generic_502() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral listener");
+    let dead_addr = listener.local_addr().expect("resolved address");
+    drop(listener);
+
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&format!("http://{dead_addr}")).expect("dead upstream url"),
+        machine_keys,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let body = response.bytes().await.expect("502 body");
+    let body_text = String::from_utf8_lossy(&body);
+    assert_eq!(
+        body.as_ref(),
+        &b"upstream unreachable"[..],
+        "generic safe 502 body"
+    );
+    assert!(
+        !body_text.contains(&dead_addr.to_string()),
+        "502 must not expose the upstream address"
+    );
+    assert!(
+        !body_text.contains("test-meter-key-machine-a"),
+        "502 must not expose credentials"
+    );
+    assert!(
+        !body_text.contains("machine-a"),
+        "502 must not expose machine identity"
+    );
+}
+
+#[tokio::test]
+async fn caller_cancellation_stops_upstream_pumping() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(cancellation_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+    let gateway_addr: SocketAddr = gateway_url
+        .trim_start_matches("http://")
+        .parse()
+        .expect("gateway socket addr");
+
+    let mut stream = TcpStream::connect(gateway_addr)
+        .await
+        .expect("connect to gateway");
+    stream
+        .write_all(
+            b"POST /v1/responses HTTP/1.1\r\n\
+Host: gateway\r\n\
+Transfer-Encoding: chunked\r\n\
+X-Meter-Key: test-meter-key-machine-a\r\n\
+\r\n",
+        )
+        .await
+        .expect("write request head");
+    stream
+        .write_all(b"6\r\npart-A\r\n")
+        .await
+        .expect("write part A");
+
+    let mut raw = Vec::new();
+    read_raw_until(&mut stream, &mut raw, b"data: first\n\n").await;
+    assert!(
+        String::from_utf8_lossy(&raw).contains("data: first\n\n"),
+        "streaming has begun before cancellation"
+    );
+
+    drop(stream);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if *upstream.dropped.lock().unwrap() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("gateway kept pumping upstream after caller cancelled");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn prefixed_upstream_base_preserves_codex_prefix_on_both_routes() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/backend-api/codex/responses", post(fake_upstream_handler))
+        .route(
+            "/backend-api/codex/responses/compact",
+            post(fake_upstream_handler),
+        )
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&format!("{upstream_url}/backend-api/codex/"))
+            .expect("prefixed fake upstream url"),
+        machine_keys,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway for responses");
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "/v1/responses reaches the prefixed upstream path"
+    );
+
+    let response = client
+        .post(format!("{gateway_url}/v1/responses/compact?debug=1"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-compact-body-07")
+        .send()
+        .await
+        .expect("caller reaches gateway for compact");
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "/v1/responses/compact reaches the prefixed upstream path"
+    );
+
+    {
+        let captured = upstream.captured.lock().unwrap();
+        assert_eq!(captured.len(), 2, "both routes reach the prefixed upstream");
+        assert_eq!(captured[0].method, "POST");
+        assert_eq!(captured[0].path, "/backend-api/codex/responses");
+        assert_eq!(captured[0].body, b"opaque-request-body-42");
+        assert_eq!(captured[0].query, None);
+        assert_eq!(captured[1].method, "POST");
+        assert_eq!(captured[1].path, "/backend-api/codex/responses/compact");
+        assert_eq!(captured[1].query.as_deref(), Some("debug=1"));
+        assert_eq!(captured[1].body, b"opaque-compact-body-07");
+    }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Write Behavior Task"
+  short_description: "Frame outcome-owned tasks without file decomposition"
+  default_prompt: "Use $write-behavior-task to write an outcome-owned task for this repository."
