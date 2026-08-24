@@ -7,7 +7,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get};
 use axum::Router;
 use futures_util::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
@@ -83,8 +83,7 @@ impl Gateway {
 
     pub fn router(&self) -> Router {
         Router::new()
-            .route("/v1/responses", post(handle_responses))
-            .route("/v1/responses/compact", post(handle_responses_compact))
+            .route("/v1/*path", any(handle_v1))
             .route("/healthz", get(healthz))
             .with_state(self.clone())
     }
@@ -162,12 +161,8 @@ fn connection_nominated_headers(headers: &HeaderMap) -> HashSet<HeaderName> {
         .collect()
 }
 
-async fn handle_responses(State(gateway): State<Gateway>, req: Request<Body>) -> Response {
-    route_responses(gateway, req, "responses").await
-}
-
-async fn handle_responses_compact(State(gateway): State<Gateway>, req: Request<Body>) -> Response {
-    route_responses(gateway, req, "responses/compact").await
+async fn handle_v1(State(gateway): State<Gateway>, req: Request<Body>) -> Response {
+    route_v1(gateway, req).await
 }
 
 /// Minimal health endpoint (see DESIGN.md §2): no authentication required;
@@ -177,7 +172,19 @@ async fn healthz() -> StatusCode {
     StatusCode::OK
 }
 
-async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: &str) -> Response {
+/// Forward an authenticated request under the `/v1` provider prefix to the
+/// fixed upstream base.
+///
+/// The caller's original HTTP method, relative path below `/v1`, query, and
+/// (per the header policy) headers and streaming body are forwarded unchanged.
+/// The upstream scheme/host/port/base prefix are never caller-controlled: the
+/// upstream URL is built only from the fixed [`Gateway::upstream_base`] plus
+/// the caller's relative path below `/v1` (DESIGN.md §2, SSRF prevention).
+///
+/// `/v1/responses` and `/v1/responses/compact` retain their existing usage
+/// observation and canonical records; every other provider path is forwarded
+/// and lifecycle-logged without inventing usage (issue #29).
+async fn route_v1(gateway: Gateway, req: Request<Body>) -> Response {
     let mut keys = req.headers().get_all("x-meter-key").iter();
     let (Some(key), None) = (keys.next(), keys.next()) else {
         return unauthorized();
@@ -187,34 +194,45 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
     };
     let digest = digest_hex(key.as_bytes());
     let Some(machine_id) = gateway.machine_keys.get(&digest) else {
-        tracing::info!(
-            route = endpoint_suffix,
-            "request rejected: missing or invalid meter key"
-        );
+        tracing::info!("request rejected: missing or invalid meter key");
         return unauthorized();
     };
-    tracing::info!(
-        route = endpoint_suffix,
-        machine_id = machine_id.as_str(),
-        "request accepted"
-    );
+    tracing::info!(machine_id = machine_id.as_str(), "request accepted");
 
-    let operation = if endpoint_suffix == "responses" {
-        Operation::Response
-    } else {
-        Operation::Compaction
+    // The route label used for lifecycle logs preserves the historical
+    // `responses` / `responses/compact` values for the metered paths and names
+    // any other provider path by its relative path below `/v1`.
+    let path = req.uri().path();
+    let suffix = path.strip_prefix("/v1").unwrap_or(path);
+    let route_label = suffix.trim_start_matches('/').to_string();
+    // Only the Responses and compact endpoints carry canonical usage
+    // observation (issue #29); every other `/v1` provider path is forwarded and
+    // lifecycle-logged via tracing without producing a canonical audit record.
+    let operation = match path {
+        "/v1/responses" => Some(Operation::Response),
+        "/v1/responses/compact" => Some(Operation::Compaction),
+        _ => None,
     };
+    let meter = operation.is_some();
 
+    // Build the upstream URL from the fixed base plus the caller's relative
+    // path below `/v1`. Only the path/query are taken from the request; the
+    // origin always stays the compiled upstream base.
     let base_path = gateway.upstream_base.path().trim_end_matches('/');
     let mut upstream_url = gateway.upstream_base.clone();
-    upstream_url.set_path(&format!("{base_path}/{endpoint_suffix}"));
+    let upstream_path = if suffix.is_empty() {
+        base_path.to_string()
+    } else {
+        format!("{base_path}{suffix}")
+    };
+    upstream_url.set_path(&upstream_path);
     if let Some(query) = req.uri().query() {
         upstream_url.set_query(Some(query));
     }
 
     let connection_nominated = connection_nominated_headers(req.headers());
 
-    let mut builder = gateway.client.post(upstream_url);
+    let mut builder = gateway.client.request(req.method().clone(), upstream_url);
     for (name, value) in req.headers().iter() {
         if request_header_is_stripped(name, &connection_nominated) {
             continue;
@@ -235,7 +253,7 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
             if status.is_success() {
                 tracing::info!(
                     event = "upstream_response",
-                    route = endpoint_suffix,
+                    route = route_label,
                     machine_id = machine_id.as_str(),
                     status = status.as_u16(),
                     "upstream response"
@@ -243,7 +261,7 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
             } else {
                 tracing::warn!(
                     event = "upstream_http_error",
-                    route = endpoint_suffix,
+                    route = route_label,
                     machine_id = machine_id.as_str(),
                     status = status.as_u16(),
                     "upstream error"
@@ -274,15 +292,17 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
             tokio::spawn(async move {
-                // The observer is independent of the upstream Content-Type: the
-                // Codex Responses client feeds the same byte stream to its own
-                // SSE parser (`eventsource-stream` 0.2.3), and real responses
-                // can be SSE-framed even under a JSON Content-Type (issue #20).
-                // The pump mirrors every forwarded byte and the observer parses
-                // the mirror once at lifecycle finalization; a body that never
+                // For the metered Responses paths the observer is independent
+                // of the upstream Content-Type: the Codex Responses client feeds
+                // the same byte stream to its own SSE parser
+                // (`eventsource-stream` 0.2.3), and real responses can be
+                // SSE-framed even under a JSON Content-Type (issue #20). The
+                // pump mirrors every forwarded byte and the observer parses the
+                // mirror once at lifecycle finalization; a body that never
                 // frames as SSE is extracted as complete JSON (see
-                // `usage::StreamUsageParser`).
-                let mut parser = StreamUsageParser::new(header_model);
+                // `usage::StreamUsageParser`). Other provider paths are pumped
+                // unchanged and lifecycle-logged without metering.
+                let mut parser = meter.then(|| StreamUsageParser::new(header_model));
                 let mut outcome = Outcome::Completed;
                 let mut stream = upstream.bytes_stream();
                 // The response body is wrapped in `DropNotifyStream`, so this
@@ -295,7 +315,9 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
                     loop {
                         match stream.next().await {
                             Some(Ok(bytes)) => {
-                                parser.push(&bytes);
+                                if let Some(parser) = &mut parser {
+                                    parser.push(&bytes);
+                                }
                                 if tx.send(Ok(bytes)).await.is_err() {
                                     // Caller dropped the response body: stop
                                     // pumping upstream (DESIGN.md §5
@@ -323,16 +345,21 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
                 // dropped, so leaving `tx` alive until after `finalize` would
                 // delay caller-visible EOF behind the whole-body parse.
                 drop(tx);
-                parser.finalize().await;
-                record_audit(
-                    &audit,
-                    &machine_id,
-                    operation,
-                    status_u16,
-                    is_success,
-                    outcome,
-                    &parser,
-                );
+                // Only the metered Responses/compact paths record a canonical
+                // audit line; other provider paths are forwarded and
+                // lifecycle-logged via tracing without inventing usage.
+                if let (Some(parser), Some(operation)) = (&mut parser, operation) {
+                    parser.finalize().await;
+                    record_audit(
+                        &audit,
+                        &machine_id,
+                        operation,
+                        status_u16,
+                        is_success,
+                        outcome,
+                        parser,
+                    );
+                }
             });
 
             let mut response = Response::builder().status(status);
@@ -347,13 +374,15 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
                 .unwrap_or_else(|_| unauthorized())
         }
         Err(_) => {
-            let mut record = AuditRecord::new(machine_id.to_string(), operation);
-            record.upstream_status = None;
-            record.outcome = Outcome::TransportError;
-            gateway.audit.try_record(record);
+            if let Some(operation) = operation {
+                let mut record = AuditRecord::new(machine_id.to_string(), operation);
+                record.upstream_status = None;
+                record.outcome = Outcome::TransportError;
+                gateway.audit.try_record(record);
+            }
             tracing::error!(
                 event = "upstream_transport_error",
-                route = endpoint_suffix,
+                route = route_label,
                 machine_id = machine_id.as_str(),
                 "upstream transport error"
             );
