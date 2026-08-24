@@ -178,6 +178,245 @@ async fn responses_route_authenticates_valid_key_and_forwards_to_fake_upstream()
     assert_eq!(captured.body, b"opaque-request-body-42");
 }
 
+/// A synthetic model-catalog response body: Codex model discovery
+/// (`GET /v1/models?client_version=...`) returns a list JSON body that is not a
+/// Responses usage shape, so it must be forwarded unchanged and never metered.
+const MODELS_RESPONSE_FIXTURE: &str =
+    "{\"object\":\"list\",\"data\":[{\"id\":\"gpt-5.2\"},{\"id\":\"o4-mini\"}]}";
+
+#[tokio::test]
+async fn get_v1_models_with_query_is_forwarded_to_fixed_upstream_with_semantics_intact() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .fallback(canned_upstream_handler)
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                "x-codex-semantic".to_string(),
+                "models-semantic-01".to_string(),
+            ),
+        ],
+        body: MODELS_RESPONSE_FIXTURE.as_bytes().to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{gateway_url}/v1/models?client_version=0.149.1"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "model discovery must no longer be a local 404"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-codex-semantic")
+            .and_then(|v| v.to_str().ok()),
+        Some("models-semantic-01"),
+        "upstream semantic headers preserved on model discovery"
+    );
+    assert_eq!(
+        response
+            .bytes()
+            .await
+            .expect("gateway response body")
+            .as_ref(),
+        MODELS_RESPONSE_FIXTURE.as_bytes(),
+        "model discovery body forwarded byte-for-byte"
+    );
+
+    let captured = upstream
+        .captured
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("fake upstream received the model-discovery request");
+    assert_eq!(captured.method, "GET", "the caller's method is forwarded");
+    assert_eq!(
+        captured.path, "/models",
+        "the path under /v1 maps below the fixed base"
+    );
+    assert_eq!(
+        captured.query.as_deref(),
+        Some("client_version=0.149.1"),
+        "the caller's query is forwarded"
+    );
+
+    // A non-Responses provider endpoint is forwarded and lifecycle-logged, but
+    // it is not a metering lifecycle: it must never write a canonical audit
+    // record or invent usage (issue #29). Give any would-be writer a moment,
+    // then require the usage file to still be empty.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        read_jsonl(&usage_file).is_empty(),
+        "model discovery must not produce a canonical audit record"
+    );
+}
+
+#[tokio::test]
+async fn future_provider_path_is_forwarded_with_method_path_and_query_not_locally_404ed() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .fallback(canned_upstream_handler)
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![(
+            "x-codex-semantic".to_string(),
+            "future-path-semantic-01".to_string(),
+        )],
+        body: b"opaque-future-body-01".to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        usage_dir.path().join("usage.jsonl"),
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    // A path the current router has never enumerated: the generic /v1/* behavior
+    // must forward it rather than answering a local 404 from a stale allowlist.
+    let response = client
+        .post(format!("{gateway_url}/v1/responses/batch?stream=false"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a future /v1/* path is forwarded, not locally 404ed"
+    );
+    assert_eq!(
+        response
+            .bytes()
+            .await
+            .expect("gateway response body")
+            .as_ref(),
+        &b"opaque-future-body-01"[..],
+        "future-path response body forwarded unchanged"
+    );
+
+    let captured = upstream
+        .captured
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("fake upstream received the future-path request");
+    assert_eq!(captured.method, "POST");
+    assert_eq!(captured.path, "/responses/batch");
+    assert_eq!(captured.query.as_deref(), Some("stream=false"));
+    assert_eq!(captured.body, b"opaque-request-body-42");
+}
+
+#[tokio::test]
+async fn caller_request_target_cannot_escape_the_fixed_upstream_origin() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .fallback(canned_upstream_handler)
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![],
+        body: b"opaque-origin-body-01".to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        usage_dir.path().join("usage.jsonl"),
+    );
+    let gateway_url = spawn(gateway.router()).await;
+    let gateway_addr: SocketAddr = gateway_url
+        .trim_start_matches("http://")
+        .parse()
+        .expect("gateway socket addr");
+
+    // An absolute-form request target naming a hostile origin must still be
+    // forwarded to the fixed upstream base, never to the attacker-controlled
+    // scheme/host/port. The gateway builds its upstream URL only from the fixed
+    // base plus the request's relative path.
+    let request_head = b"GET http://attacker.example:9999/v1/models?client_version=1 HTTP/1.1\r\n\
+Host: attacker.example\r\n\
+X-Meter-Key: test-meter-key-machine-a\r\n\
+Connection: close\r\n\
+\r\n"
+        .to_vec();
+
+    let mut stream = TcpStream::connect(gateway_addr)
+        .await
+        .expect("connect to gateway");
+    stream
+        .write_all(&request_head)
+        .await
+        .expect("write absolute-form request");
+
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .expect("read response")
+            .expect("read response byte");
+        if n == 0 {
+            break;
+        }
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n") {
+            break;
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&buf).starts_with("HTTP/1.1 200"),
+        "an absolute-form target reaches the fixed upstream, got: {buf:?}"
+    );
+
+    let captured = upstream
+        .captured
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("the fixed upstream observed the forwarded request");
+    assert_eq!(captured.method, "GET");
+    assert_eq!(captured.path, "/models");
+    assert_eq!(captured.query.as_deref(), Some("client_version=1"));
+}
+
 #[tokio::test]
 async fn accepted_streaming_response_is_forwarded_unchanged_and_records_known_usage() {
     let upstream = FakeUpstream::default();
@@ -1272,11 +1511,10 @@ async fn invalid_x_meter_key_forms_are_rejected_with_uniform_401_before_upstream
 }
 
 #[tokio::test]
-async fn closed_route_set_reaches_upstream_only_for_known_post_paths() {
+async fn every_v1_provider_path_and_method_is_forwarded_while_non_v1_stays_local() {
     let upstream = FakeUpstream::default();
     let fake_app = Router::new()
-        .route("/responses", post(fake_upstream_handler))
-        .route("/responses/compact", post(fake_upstream_handler))
+        .fallback(fake_upstream_handler)
         .with_state(upstream.clone());
     let upstream_url = spawn(fake_app).await;
 
@@ -1293,19 +1531,46 @@ async fn closed_route_set_reaches_upstream_only_for_known_post_paths() {
     let client = reqwest::Client::new();
     let valid_key = "test-meter-key-machine-a";
 
-    for (path, body) in [
-        ("/v1/responses", "opaque-request-body-42"),
-        ("/v1/responses/compact", "opaque-compact-body-07"),
-    ] {
+    // Every path under /v1 — known, future/unknown, and any method — is
+    // forwarded below the fixed upstream base rather than answered from a stale
+    // local allowlist.
+    let cases: [(&str, reqwest::Method, &str); 5] = [
+        (
+            "/v1/responses",
+            reqwest::Method::POST,
+            "opaque-request-body-42",
+        ),
+        (
+            "/v1/responses/compact",
+            reqwest::Method::POST,
+            "opaque-compact-body-07",
+        ),
+        (
+            "/v1/unknown",
+            reqwest::Method::POST,
+            "opaque-request-body-42",
+        ),
+        (
+            "/v1/responses/other",
+            reqwest::Method::POST,
+            "opaque-request-body-42",
+        ),
+        ("/v1/responses", reqwest::Method::GET, ""),
+    ];
+    for (path, method, body) in cases {
         let response = client
-            .post(format!("{gateway_url}{path}"))
+            .request(method.clone(), format!("{gateway_url}{path}"))
             .header("x-meter-key", valid_key)
             .body(body)
             .send()
             .await
             .unwrap_or_else(|err| panic!("{path}: caller reaches gateway: {err}"));
 
-        assert_eq!(response.status(), StatusCode::CREATED, "{path} status");
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "{path} {method} status"
+        );
         assert_eq!(
             response.bytes().await.expect("read upstream body").as_ref(),
             &b"opaque-upstream-body-01"[..],
@@ -1315,34 +1580,22 @@ async fn closed_route_set_reaches_upstream_only_for_known_post_paths() {
 
     {
         let captured = upstream.captured.lock().unwrap();
-        assert_eq!(captured.len(), 2, "both known paths reach upstream");
+        assert_eq!(captured.len(), 5, "every /v1 request reaches upstream");
         assert_eq!(captured[0].method, "POST");
         assert_eq!(captured[0].path, "/responses");
-        assert_eq!(captured[0].body, b"opaque-request-body-42");
         assert_eq!(captured[1].method, "POST");
         assert_eq!(captured[1].path, "/responses/compact");
-        assert_eq!(captured[1].body, b"opaque-compact-body-07");
+        assert_eq!(captured[2].method, "POST");
+        assert_eq!(captured[2].path, "/unknown");
+        assert_eq!(captured[3].method, "POST");
+        assert_eq!(captured[3].path, "/responses/other");
+        assert_eq!(captured[4].method, "GET");
+        assert_eq!(captured[4].path, "/responses");
     }
 
-    for (method, path) in [
-        (reqwest::Method::GET, "/v1/responses"),
-        (reqwest::Method::DELETE, "/v1/responses/compact"),
-    ] {
-        let response = client
-            .request(method.clone(), format!("{gateway_url}{path}"))
-            .header("x-meter-key", valid_key)
-            .send()
-            .await
-            .unwrap_or_else(|err| panic!("{path}: caller reaches gateway: {err}"));
-
-        assert_eq!(
-            response.status(),
-            StatusCode::METHOD_NOT_ALLOWED,
-            "{method} {path} status"
-        );
-    }
-
-    for path in ["/v1/unknown", "/v1/responses/other", "/nope"] {
+    // A path outside the /v1 provider prefix is not provider traffic and stays
+    // a local 404, never reaching the upstream.
+    for path in ["/nope", "/v2/responses"] {
         let response = client
             .post(format!("{gateway_url}{path}"))
             .header("x-meter-key", valid_key)
@@ -1356,8 +1609,8 @@ async fn closed_route_set_reaches_upstream_only_for_known_post_paths() {
 
     assert_eq!(
         upstream.captured.lock().unwrap().len(),
-        2,
-        "wrong method and unknown path never reach upstream"
+        5,
+        "only /v1 provider traffic reaches upstream"
     );
 }
 
