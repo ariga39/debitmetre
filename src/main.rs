@@ -15,6 +15,11 @@ use debitmetre::Gateway;
 /// Default config path when `--config` is not given.
 const DEFAULT_CONFIG_PATH: &str = "/etc/debitmetre/config.toml";
 
+/// Opt-in operator load-smoke command (issue #25), compiled only with the
+/// test-only upstream-override seam it needs to drive the real gateway.
+#[cfg(feature = "test-upstream-override")]
+mod smoke;
+
 /// What the operator asked the binary to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Command {
@@ -22,14 +27,23 @@ enum Command {
     Run { config: PathBuf },
     /// Print accumulated token usage grouped by machine and model (issue #3).
     Summary { config: PathBuf },
+    /// Opt-in mock load smoke through the real gateway (issue #25).
+    #[cfg(feature = "test-upstream-override")]
+    Smoke { params: smoke::SmokeParams },
 }
 
 /// CLI argument errors. Static messages only; argument values are never echoed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CliError {
     Help,
     UnknownOption,
     MissingValue,
+    /// The `smoke` subcommand requested its help text (issue #25).
+    #[cfg(feature = "test-upstream-override")]
+    SmokeHelp,
+    /// A sanitized `smoke` argument error (issue #25).
+    #[cfg(feature = "test-upstream-override")]
+    Smoke(String),
 }
 
 impl std::fmt::Display for CliError {
@@ -38,23 +52,43 @@ impl std::fmt::Display for CliError {
             CliError::Help => Ok(()),
             CliError::UnknownOption => write!(f, "unknown option (see --help)"),
             CliError::MissingValue => write!(f, "--config requires a path argument"),
+            #[cfg(feature = "test-upstream-override")]
+            CliError::SmokeHelp => Ok(()),
+            #[cfg(feature = "test-upstream-override")]
+            CliError::Smoke(message) => write!(f, "{message}"),
         }
     }
 }
 
-fn usage() -> &'static str {
-    "debitmetre — central transparent proxy gateway for Codex clients\n\
-     \n\
-     USAGE:\n\
-     \x20  debitmetre [--config <PATH>]          run the gateway\n\
-     \x20  debitmetre summary [--config <PATH>]  print accumulated token usage by machine and model\n\
-     \n\
-     OPTIONS:\n\
-     \x20  --config <PATH>   path to the TOML config (default: /etc/debitmetre/config.toml)\n\
-     \x20  -h, --help        print this help"
+fn usage() -> String {
+    #[cfg(feature = "test-upstream-override")]
+    let smoke_line =
+        "   debitmetre smoke [OPTIONS]              run a mock load smoke through the real gateway\n";
+    #[cfg(not(feature = "test-upstream-override"))]
+    let smoke_line = "";
+    format!(
+        "debitmetre — central transparent proxy gateway for Codex clients\n\
+         \n\
+         USAGE:\n\
+         \x20  debitmetre [--config <PATH>]          run the gateway\n\
+         \x20  debitmetre summary [--config <PATH>]  print accumulated token usage by machine and model\n\
+         {smoke_line}\
+         \n\
+         OPTIONS:\n\
+         \x20  --config <PATH>   path to the TOML config (default: /etc/debitmetre/config.toml)\n\
+         \x20  -h, --help        print this help"
+    )
 }
 
 fn parse_args(args: &[String]) -> Result<Command, CliError> {
+    // The smoke subcommand has its own dedicated options; it must be first.
+    #[cfg(feature = "test-upstream-override")]
+    if let Some(first) = args.first() {
+        if first == "smoke" {
+            return smoke::parse_smoke(&args[1..]).map(|params| Command::Smoke { params });
+        }
+    }
+
     let mut config: Option<PathBuf> = None;
     let mut summary_command = false;
     let mut iter = args.iter();
@@ -129,6 +163,11 @@ async fn main() -> ExitCode {
             println!("{}", usage());
             return ExitCode::SUCCESS;
         }
+        #[cfg(feature = "test-upstream-override")]
+        Err(CliError::SmokeHelp) => {
+            println!("{}", smoke::usage());
+            return ExitCode::SUCCESS;
+        }
         Err(err) => {
             eprintln!("debitmetre: {err}");
             eprintln!("{}", usage());
@@ -138,6 +177,25 @@ async fn main() -> ExitCode {
     match command {
         Command::Run { config } => run_gateway(config).await,
         Command::Summary { config } => run_summary(config),
+        #[cfg(feature = "test-upstream-override")]
+        Command::Smoke { params } => run_smoke(params).await,
+    }
+}
+
+/// Opt-in mock load smoke command (issue #25): run oha through the real gateway
+/// into a loopback mock upstream, reconcile the audit records, and print a
+/// sanitized report. Errors go to stderr and exit non-zero.
+#[cfg(feature = "test-upstream-override")]
+async fn run_smoke(params: smoke::SmokeParams) -> ExitCode {
+    match smoke::run(&params).await {
+        Ok(report) => {
+            println!("{report}");
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("debitmetre smoke: {err}");
+            ExitCode::FAILURE
+        }
     }
 }
 

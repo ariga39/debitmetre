@@ -126,6 +126,32 @@ port and step timeout; invalid values (including 0, negatives, fractions, and
 option-like strings) fail before any traffic, and the port must be a free
 integer in `1..65535`.
 
+### Mock load smoke through the real gateway (opt-in)
+
+`debitmetre smoke` is an operator opt-in load smoke (issue #25): it runs the
+external [oha](https://github.com/hatoo/oha) load generator through the **real
+release gateway** into a loopback-only deterministic mock upstream that streams
+terminal SSE carrying canonical model/usage, then reconciles the canonical audit
+records. It contacts no real upstream and consumes zero model tokens. Because it
+needs the test-only upstream seam to point the fixed upstream at the mock, it is
+available only in a test-feature build:
+
+```sh
+OHA_BIN=/path/to/oha cargo build --release --features test-upstream-override
+OHA_BIN=/path/to/oha target/release/debitmetre smoke --count 100 --concurrency 10
+```
+
+The harness finds oha via `OHA_BIN` or on `PATH`, or `--oha <PATH>`. Workload and
+sizing are configurable with safe defaults (`--count 100`, `--concurrency 10`,
+`--response-bytes 4096`, `--delay-ms 5`) that still create concurrent live
+streams on an ordinary machine; `--port 0` picks a free loopback port. It
+reports the oha version/workload, completed/success/errors, reference
+RPS + p50/p95/p99, gateway baseline/peak/end RSS, and canonical audit
+accepted/metered counts. It fails on load errors, non-2xx responses, or missing
+or mismatched audit records, cleans up its local processes and temporary
+artifacts, and prints only sanitized aggregate evidence. It never applies an
+arbitrary RSS threshold and never changes production behavior.
+
 ### Process-level test
 
 The process-level test starts the built binary with synthetic configuration, observes readiness,
