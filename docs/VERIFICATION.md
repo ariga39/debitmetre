@@ -33,9 +33,11 @@ binary on a loopback port, points your existing authenticated `codex` CLI at it 
 provider, and runs the explicit installed `gpt-5.6-luna` model (issue #31) on a deterministic multi-file
 Python diagnostic task in a disposable git repository. The generated task has an interacting
 loader/aggregate/CLI call chain with two seeded behavioral defects; the independent acceptance command
-must **fail before** Codex runs (honest red evidence) and **pass after** Codex repairs the source, while
-the task README, data fixture, and acceptance test stay byte-for-byte unchanged (success must come from
-real source changes only). It prints only sanitized pass/fail evidence (task red/green, canonical audit
+must **fail before** Codex runs (honest red evidence) and **pass after** Codex repairs the source. The task
+README, data fixture, and acceptance test are protected contract files that cannot influence the result:
+any edits Codex makes to them are discarded (restored to their committed bytes) before the original
+acceptance is re-run, so success must come from real source changes only. It prints only sanitized
+pass/fail evidence (task red/green, canonical audit
 record shape, per-model summary grouping, lifecycle logs, protected-file provenance). It also explicitly
 proves, from sanitized method/route/status lifecycle-log evidence, that the Codex model-discovery
 `GET /v1/models` request was accepted and received a 2xx upstream response, so a non-fatal local or
