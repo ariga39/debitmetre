@@ -9,13 +9,13 @@
 # sanitized pass/fail evidence for task success, canonical usage, model
 # attribution, per-model summary, and diagnostic logs.
 #
-# Hard opt-in: set DEBITMETRE_REAL_E2E=1. Without it this script is a safe
-# no-op; it is never invoked by cargo tests or CI. The synthetic X-Meter key is
-# runtime-only (from DEBITMETRE_E2E_METER_KEY or generated); only its SHA-256
-# digest enters the temporary gateway config, and the raw key is never printed
-# or persisted. No VPS, Docker, nginx, systemd, or fixed deployment is assumed:
-# everything runs on the loopback interface and is torn down by a trap unless
-# DEBITMETRE_E2E_KEEP=1.
+# Hard opt-in: set DEBITMETRE_REAL_E2E=1. Without it this script exits 2 and
+# does nothing; it is never invoked by cargo tests or CI. The synthetic X-Meter
+# key is runtime-only (from DEBITMETRE_E2E_METER_KEY or generated); only its
+# SHA-256 digest enters the temporary gateway config, and the raw key is never
+# printed or persisted. No VPS, Docker, nginx, systemd, or fixed deployment is
+# assumed: everything runs on the loopback interface and is torn down by a trap
+# unless DEBITMETRE_E2E_KEEP=1.
 #
 # Prerequisites: bash, cargo, codex, python3, jq, curl, git, sha256sum,
 # timeout, awk.
@@ -28,7 +28,8 @@
 #   DEBITMETRE_E2E_KEEP       "1" retains artifacts in the temp dir
 #
 # Exit status: 0 only when every sanitized check passes; any failure exits
-# non-zero after printing a stage-named error.
+# non-zero after printing a stage-named error. Without the opt-in flag the
+# script exits 2.
 
 set -euo pipefail
 
@@ -42,10 +43,11 @@ die() {
 }
 
 # --- opt-in guard ----------------------------------------------------------
-# Never run in normal cargo tests or CI; without the flag this is a no-op.
+# Never run in normal cargo tests or CI; without the flag this is a no-op that
+# exits 2 (exit 0 is reserved for a fully passing E2E).
 if [ "${DEBITMETRE_REAL_E2E:-}" != "1" ]; then
     echo "debitmetre e2e: opt-in required: set DEBITMETRE_REAL_E2E=1 to run the real-codex loopback self-test"
-    exit 0
+    exit 2
 fi
 
 # --- location and prerequisites -------------------------------------------
@@ -183,7 +185,7 @@ git -C "$WORKDIR/task-repo" -c user.name="debitmetre-e2e" -c user.email="e2e@exa
 MARKER="DEBITMETRE-E2E-TASK-BODY-MARKER"
 PROMPT="$MARKER Implement the missing add function in src/add.py so that the independent check 'python3 test_add.py' passes. Do not modify test_add.py."
 CODEX_EXIT=0
-if ! timeout "$TIMEOUT" codex exec -C "$WORKDIR/task-repo" \
+if timeout "$TIMEOUT" codex exec -C "$WORKDIR/task-repo" \
     -c 'model_providers.debitmetre.name="debitmetre"' \
     -c "model_providers.debitmetre.base_url=\"http://127.0.0.1:$PORT/v1\"" \
     -c 'model_providers.debitmetre.wire_api="responses"' \
@@ -193,6 +195,8 @@ if ! timeout "$TIMEOUT" codex exec -C "$WORKDIR/task-repo" \
     --dangerously-bypass-approvals-and-sandbox --ephemeral \
     "$PROMPT" < /dev/null > "$WORKDIR/codex-run.out" 2>&1
 then
+    CODEX_EXIT=0
+else
     CODEX_EXIT=$?
     die codex "codex exec failed (exit $CODEX_EXIT after up to ${TIMEOUT}s)"
 fi
@@ -209,23 +213,37 @@ GATEWAY_PID=""
 sleep 1
 
 # --- validate audit records; no raw records are printed --------------------
+# Every present usage counter must be a JSON number, integral, and
+# nonnegative; at least one present counter must be positive; the record must
+# carry non-null usage and a non-null model.
 if ! jq -e --slurp '
     any(.[];
         (.kind == "request")
         and (.usage != null)
         and (.model != null)
-        and ([.usage | to_entries[] | select(.value != null) | .value] | all(.[]; . >= 0))
-        and ([.usage | to_entries[] | select(.value != null) | .value] | any(.[]; . > 0))
+        and (
+            [.usage | to_entries[] | select(.value != null) | .value]
+            | all(.[]; (type == "number") and (floor == .) and (. >= 0))
+        )
+        and (
+            [.usage | to_entries[] | select(.value != null) | .value]
+            | any(.[]; (type == "number") and (. > 0))
+        )
     )' "$WORKDIR/usage.jsonl" >/dev/null 2>&1
 then
-    die validate "no accepted audit record with non-null usage and model, nonnegative counters, and nonzero usage"
+    die validate "no accepted audit record with non-null usage and model, integral nonnegative counters, and nonzero usage"
 fi
 
 # --- debitmetre summary: a non-missing model group with nonzero totals -----
+# Only the aggregated row count is reported; per-model names and token totals
+# are never printed.
 if ! "$BIN" summary --config "$WORKDIR/gateway.toml" > "$WORKDIR/summary.out" 2> "$WORKDIR/summary.err"; then
     die summary "debitmetre summary command failed"
 fi
-if ! awk 'NR >= 2 && $1 != "machine" && $2 != "-" && $2 != "=" && $NF ~ /^[0-9]+$/ && $NF > 0 { found = 1 } END { exit found ? 0 : 1 }' "$WORKDIR/summary.out"
+if ! SUMMARY_ROWS="$(awk '
+    NR >= 2 && $1 != "machine" && $2 != "-" && $2 != "=" && $NF ~ /^[0-9]+$/ && $NF > 0 { found = 1; rows++ }
+    END { if (found) print rows; else exit 1 }
+' "$WORKDIR/summary.out")"
 then
     die summary "debitmetre summary shows no model group with nonzero totals"
 fi
@@ -246,11 +264,12 @@ if grep -qF "$MARKER" "$LOG"; then
 fi
 
 # --- concise sanitized evidence --------------------------------------------
+# Only aggregate counts are printed: never raw records, prompts, responses,
+# model names, or exact token totals.
 RECORDS="$(jq --slurp 'length' "$WORKDIR/usage.jsonl")"
 echo "debitmetre e2e: PASS task: independent add(a,b) Python test passed"
-echo "debitmetre e2e: PASS audit: accepted record has non-null usage and model, nonnegative counters, nonzero usage"
+echo "debitmetre e2e: PASS audit: accepted record has non-null usage and model, integral nonnegative counters, nonzero usage"
 echo "debitmetre e2e: PASS summary: debitmetre summary shows a model group with nonzero totals"
 echo "debitmetre e2e: PASS logs: accepted/upstream lifecycle events; no raw meter key or task body marker"
 echo "debitmetre e2e: evidence: codex_exit=$CODEX_EXIT records=$RECORDS port=$PORT"
-echo "debitmetre e2e: evidence: debitmetre summary (sanitized aggregate):"
-cat "$WORKDIR/summary.out"
+echo "debitmetre e2e: evidence: summary_rows=$SUMMARY_ROWS has_nonzero=1"
