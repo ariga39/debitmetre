@@ -318,6 +318,11 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
                 if !completed {
                     outcome = Outcome::ClientCancelled;
                 }
+                // Close the response channel before parsing the mirror: the
+                // caller's `ReceiverStream` produces EOF only once the sender is
+                // dropped, so leaving `tx` alive until after `finalize` would
+                // delay caller-visible EOF behind the whole-body parse.
+                drop(tx);
                 parser.finalize().await;
                 record_audit(
                     &audit,
