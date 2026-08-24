@@ -150,7 +150,7 @@ the audit: it never computes prices, equivalent cost, or daily billing reports. 
 values; a counter never recorded renders as missing, never as an invented 0. Coverage is the share of
 accepted request lifecycles whose record carries a non-null usage object (partial usage still counts).
 Malformed complete lines and an unfinished trailing crash line are warned about and never counted.
-The exact command invocation is documented in docs/OPERATIONS.md.
+The exact command invocation is documented in [docs/OPERATIONS.md](OPERATIONS.md).
 
 ## 6. fail-open / fail-closed
 
@@ -161,8 +161,11 @@ The exact command invocation is documented in docs/OPERATIONS.md.
   body bytes and ordering received by the client are completely unchanged; audit records may be lost.
 - Metering parse failures, malformed data, and audit failures must never change the already-received upstream
   status/header/body, and must never proactively cancel a request that could otherwise continue.
-- Runtime diagnostics: emit sanitized events to stderr without machine/request/credential information
-  (`audit_write_failed` / `audit_dropped`); the MVP has no metrics system, dashboard, or detailed labels.
+- Runtime diagnostics: emit sanitized events to stderr logging only the allowlisted fields — the stable
+  `machine_id`, request `operation` (route), `outcome`, and upstream `status` (`audit_write_failed` /
+  `audit_dropped`); credentials, `Authorization`/OAuth material, bodies, ChatGPT account or upstream
+  request identifiers, raw headers, and client network metadata are forbidden. The MVP has no metrics
+  system, dashboard, or detailed labels.
 
 ## 7. Storage semantics
 
@@ -186,7 +189,7 @@ The exact command invocation is documented in docs/OPERATIONS.md.
 - Deferred to future work: global body budget, admission queue, per-client/global concurrency control,
   and systemd MemoryMax/stream slots tuning. Production performance optimization and limits remain
   measurement-driven and deferred until evidence justifies them; the shipped opt-in mock load smoke
-  (see docs/VERIFICATION.md) is measurement tooling, not a production limit or optimization.
+  (see [docs/VERIFICATION.md](VERIFICATION.md)) is measurement tooling, not a production limit or optimization.
 - Fallback to direct connection: a purely operational action (switching the Codex provider back to direct connection); automatic failover is not implemented.
 
 ## 9. MVP scope and non-goals
@@ -229,7 +232,11 @@ The following issues do not block specification or test writing, but they do blo
 - [ ] Whether the `response.done` event actually exists (determines whether it is included for compatibility).
 - [ ] Confirmation of the real response shape of the compact route.
 
-## 12. Initial outcome issues
+## 12. Initial outcome issues (historical provenance)
+
+> Historical provenance: this section records the outcomes that motivated the original design grill and the
+> initial vertical slices. It is not the current roadmap or an acceptance contract; current behavior is
+> specified in the sections above (and the shipped verification in [VERIFICATION.md](VERIFICATION.md)).
 
 1. A Codex caller holding a valid machine key can get semantically transparent responses through the fixed Responses/compact routes,
    and unauthorized callers are rejected before touching the upstream.

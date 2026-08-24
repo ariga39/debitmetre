@@ -6,18 +6,36 @@ specified there, this guide focuses on how to use it.
 
 ## Build and run
 
-Build the single binary against a local TOML configuration:
+Build the single binary and run it against a local copy of the example configuration:
 
 ```sh
 cargo build --release
-sudo install -m 0755 target/release/debitmetre /usr/local/bin/debitmetre
-sudo install -m 0600 config.example.toml /etc/debitmetre/config.toml
-debitmetre --config /etc/debitmetre/config.toml
+cp config.example.toml ./debitmetre.toml
+sed -i 's|/var/lib/debitmetre/usage.jsonl|./usage.jsonl|' ./debitmetre.toml
+target/release/debitmetre --config ./debitmetre.toml
 ```
 
-`--config` defaults to `/etc/debitmetre/config.toml`; use `debitmetre --help` for the full usage text.
-Operational logs go to stderr (suitable for a terminal, journald, or an operator-selected supervisor) and
-never print meter keys or request/response bodies.
+This local run needs no privileges: it binds the configured loopback `listen` address and creates
+`./usage.jsonl` in the current working directory. Relative paths in the config (like `usage_file`) resolve
+from the process working directory. `--config` defaults to `/etc/debitmetre/config.toml`; use
+`debitmetre --help` for the full usage text. Operational logs go to stderr (suitable for a terminal,
+journald, or an operator-selected supervisor).
+
+### Optional system-wide install
+
+A system-wide install is optional and is left to the operator. Choose a dedicated runtime user, create and
+chown the configuration and data locations to that user, and run the binary as that user. The repository
+ships only the TOML example; it does not ship or prescribe a supervisor, service unit, or service user.
+
+```sh
+sudo useradd --system --home-dir /var/lib/debitmetre --shell /usr/sbin/nologin debitmetre
+sudo install -d -o debitmetre -g debitmetre /etc/debitmetre /var/lib/debitmetre
+sudo install -m 0600 -o debitmetre -g debitmetre config.example.toml /etc/debitmetre/config.toml
+sudo -u debitmetre debitmetre --config /etc/debitmetre/config.toml
+```
+
+`usage_file` in the installed config must be a path the runtime user owns and can write, for example
+`/var/lib/debitmetre/usage.jsonl`.
 
 ## Configuration
 
@@ -49,7 +67,17 @@ same way: an invalid or unwritable path prevents startup.
 
 After a successful startup, a transient audit write failure is **fail-open**: the caller-visible upstream
 response stays unchanged and a sanitized `audit_write_failed` diagnostic is emitted to stderr. Runtime
-diagnostics never include machine/request/credential information. See DESIGN.md §6–§7 for the full contract.
+diagnostics log only the allowlisted fields below; they never include credentials, bodies, raw headers,
+account or upstream request identifiers, or client network metadata. See DESIGN.md §6–§7 for the full
+contract.
+
+## Logging and privacy
+
+Operational logs go to stderr. The allowlisted fields the gateway intentionally logs are the stable
+`machine_id`, the request `operation` (route), the `outcome`, and the upstream `status`. The following are
+**forbidden** from any log or diagnostic: meter keys/credentials, `Authorization`/OAuth material, request or
+response bodies, ChatGPT account or upstream request identifiers, raw headers, and client network metadata
+(for example IP addresses). The audit record itself is governed by the stricter allowlist in DESIGN.md §5.
 
 ## Readiness and routing
 
@@ -67,7 +95,7 @@ Run one local command with the same configuration to see the recorded token fact
 configured usage file, grouped by machine and model:
 
 ```sh
-debitmetre summary --config /etc/debitmetre/config.toml
+target/release/debitmetre summary --config ./debitmetre.toml
 ```
 
 The output is a fixed-width table (machine, model, record count, then input, uncached, cache-read,

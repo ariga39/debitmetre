@@ -1,32 +1,36 @@
 # debitmetre
 
 A central transparent proxy gateway that sits between multiple Codex clients and the single OpenAI Codex
-upstream. For each accepted request it records canonical, quality-marked token usage (raw token facts) per
-machine and model into an append-only JSONL audit file, and can summarize what it recorded.
+upstream. For each accepted request lifecycle it best-effort attempts one canonical audit record — raw
+token facts per machine and model — in an append-only JSONL file; usage or model may be absent per the
+contract. It can also summarize what it recorded.
 
 It does **not** compute prices, equivalent cost, or daily billing reports — those are future offline outcomes.
 
-## Build, configure, run
+## Build, configure, run (local first run)
 
 ```sh
 cargo build --release
-sudo install -m 0755 target/release/debitmetre /usr/local/bin/debitmetre
-sudo install -m 0600 config.example.toml /etc/debitmetre/config.toml
-debitmetre --config /etc/debitmetre/config.toml
+cp config.example.toml ./debitmetre.toml
+sed -i 's|/var/lib/debitmetre/usage.jsonl|./usage.jsonl|' ./debitmetre.toml
+target/release/debitmetre --config ./debitmetre.toml
 ```
 
-`--config` defaults to `/etc/debitmetre/config.toml`; use `debitmetre --help` for the full usage text.
-Operational logs go to stderr (suitable for a terminal, journald, or an operator-selected supervisor) and
-never print meter keys or request/response bodies.
+This first run needs no privileges: it binds the loopback listener and creates `./usage.jsonl` in the
+current working directory. Relative paths in the config (like `usage_file`) resolve from the process
+working directory. `--config` defaults to `/etc/debitmetre/config.toml`; use `debitmetre --help` for the
+full usage text. Operational logs go to stderr (suitable for a terminal, journald, or an operator-selected
+supervisor) and never print meter keys or request/response bodies.
 
 ## View accumulated usage
 
 ```sh
-debitmetre summary --config /etc/debitmetre/config.toml
+target/release/debitmetre summary --config ./debitmetre.toml
 ```
 
 The summary aggregates the recorded token facts by machine and model and reports the overall metering
 coverage of accepted request lifecycles. It does not calculate prices, equivalent cost, or daily billing.
+For a system-wide install under an operator-selected supervisor, see [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## Documentation
 
