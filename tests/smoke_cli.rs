@@ -191,4 +191,62 @@ fn smoke_run_reconciles_audit_and_prints_sanitized_report() {
         !stderr.contains("machine-smoke"),
         "stderr is sanitized, got: {stderr}"
     );
+    // The report must carry the oha version but never the executable path: the
+    // exact path supplied on the command line must not appear anywhere.
+    let oha_path = oha.to_str().expect("oha path is utf-8");
+    assert!(
+        !stdout.contains(oha_path),
+        "report must not expose the oha executable path, got: {stdout}"
+    );
+}
+
+/// Child-process cleanup is exception-safe: a deliberately failing oha must make
+/// the smoke command fail, yet the gateway subprocess it spawned must still be
+/// terminated and reaped so its loopback port is released and reusable after the
+/// command exits. This exercises process cleanup, not the load generator.
+#[cfg(unix)]
+#[test]
+fn failing_oha_still_releases_the_gateway_port() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let fake_oha = dir.path().join("fake-oha");
+    std::fs::write(&fake_oha, "#!/bin/sh\nexit 1\n").expect("write fake oha");
+    std::fs::set_permissions(&fake_oha, std::fs::Permissions::from_mode(0o755))
+        .expect("make fake oha executable");
+
+    // Pick an explicit free loopback port for the smoke gateway.
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+        let port = listener.local_addr().expect("probe addr").port();
+        drop(listener);
+        port
+    };
+
+    let output = Command::new(env!("CARGO_BIN_EXE_debitmetre"))
+        .arg("smoke")
+        .arg("--count")
+        .arg("5")
+        .arg("--concurrency")
+        .arg("2")
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--oha")
+        .arg(&fake_oha)
+        .env("OHA_BIN", &fake_oha)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run the debitmetre binary");
+    assert!(
+        !output.status.success(),
+        "failing oha must make the smoke command fail"
+    );
+
+    // After the command exits, the gateway must be gone and its port reusable.
+    let rebound = std::net::TcpListener::bind(("127.0.0.1", port)).is_ok();
+    assert!(
+        rebound,
+        "gateway loopback port must be released after the smoke command exits"
+    );
 }

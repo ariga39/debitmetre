@@ -41,7 +41,9 @@ const DEFAULT_COUNT: u64 = 100;
 const DEFAULT_CONCURRENCY: u64 = 10;
 const DEFAULT_RESPONSE_BYTES: u64 = 4096;
 const DEFAULT_DELAY_MS: u64 = 5;
-const DEFAULT_PORT: u16 = 18799;
+/// Default gateway port: 0 means pick a free loopback port, the collision-safe
+/// default.
+const DEFAULT_PORT: u16 = 0;
 
 /// Sanitized static report labels. Only aggregates are printed; never raw
 /// records, bodies, keys, or exact token totals.
@@ -94,7 +96,7 @@ pub fn usage() -> &'static str {
      \x20  --response-bytes <B>   mock response body bytes (default: 4096)\n\
      \x20  --delay-ms <D>         mock stream delay between chunks (default: 5)\n\
      \x20  --oha <PATH>           path to the oha binary (default: OHA_BIN, then oha in PATH)\n\
-     \x20  --port <PORT>          gateway loopback port, 0 = free (default: 18799)\n\
+     \x20  --port <PORT>          gateway loopback port, 0 = free (default: 0, a free port)\n\
      \x20  -h, --help             print this help"
 }
 
@@ -350,6 +352,47 @@ fn spawn_gateway(
     Ok((child, config_path, usage_file))
 }
 
+/// RAII ownership of the smoke run's subprocesses. On every path — success,
+/// error, or a panic-induced drop — it terminates and reaps the gateway and
+/// stops the mock upstream task, so no orphan process or leaked listener can
+/// survive a smoke run regardless of where it exits.
+struct SmokeProcs {
+    gateway: Option<Child>,
+    mock: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl SmokeProcs {
+    fn new(gateway: Child, mock: tokio::task::JoinHandle<()>) -> SmokeProcs {
+        SmokeProcs {
+            gateway: Some(gateway),
+            mock: Some(mock),
+        }
+    }
+
+    /// The pid of the gateway subprocess, for RSS sampling.
+    fn gateway_pid(&self) -> i32 {
+        self.gateway.as_ref().expect("gateway child present").id() as i32
+    }
+
+    /// Terminate and reap the gateway and stop the mock. Idempotent; the guard's
+    /// Drop also calls this, so an explicit call just runs it early.
+    fn shutdown(&mut self) {
+        if let Some(mut gateway) = self.gateway.take() {
+            let _ = gateway.kill();
+            let _ = gateway.wait();
+        }
+        if let Some(mock) = self.mock.take() {
+            mock.abort();
+        }
+    }
+}
+
+impl Drop for SmokeProcs {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// Pick a free loopback port (bind :0, read the assigned port, drop the
 /// listener). Fine for a smoke tool; there is a negligible reuse race.
 fn pick_free_port() -> Result<u16, String> {
@@ -394,13 +437,15 @@ pub async fn run(params: &SmokeParams) -> Result<String, String> {
     };
     let current_exe =
         std::env::current_exe().map_err(|err| format!("cannot locate the binary: {err}"))?;
-    let (mut gateway_child, _config_path, usage_file) =
+    let (gateway_child, _config_path, usage_file) =
         spawn_gateway(&current_exe, &mock_upstream, port, workdir.path())?;
-    let gateway_pid = gateway_child.id() as i32;
+    // Own the subprocesses: on every success/error path (including a `?` return
+    // or a panic) the gateway is terminated and reaped and the mock is stopped.
+    let mut procs = SmokeProcs::new(gateway_child, mock_handle);
+    let gateway_pid = procs.gateway_pid();
 
     // Wait until the gateway reports ready via its health endpoint.
     if !wait_ready(port).await {
-        let _ = gateway_child.kill();
         return Err("smoke gateway never became ready".into());
     }
 
@@ -419,17 +464,15 @@ pub async fn run(params: &SmokeParams) -> Result<String, String> {
     }
     let end_rss = process_rss_kb(gateway_pid);
 
-    // Let the gateway's background audit writer drain, then reconcile.
+    // Let the gateway's background audit writer drain, then reconcile. On any
+    // error return from here on, the guard still terminates and reaps.
     let Some((accepted, metered)) = wait_audit_count(&usage_file, oha_result.completed).await
     else {
-        let _ = gateway_child.kill();
         return Err("audit records fell short of completed requests; metering was lost".into());
     };
 
-    // Stop the gateway cleanly so the audit file is fully flushed.
-    let _ = gateway_child.kill();
-    let _ = gateway_child.wait();
-    drop(mock_handle);
+    // Stop the gateway and mock now that the load and audit drain are complete.
+    procs.shutdown();
 
     // Reconcile: accepted must equal completed, and every accepted must be metered.
     if accepted != oha_result.completed {
@@ -445,7 +488,6 @@ pub async fn run(params: &SmokeParams) -> Result<String, String> {
     }
 
     Ok(render_report(
-        &oha_bin,
         &oha_version,
         params,
         &oha_result,
@@ -718,8 +760,10 @@ fn success_rate(root: &Value) -> Option<f64> {
     None
 }
 
-/// Sample the gateway's RSS continuously until `stop` is dropped (i.e. the load
-/// has finished), returning the high-water mark.
+/// Sample the gateway's RSS continuously throughout the oha run, returning the
+/// high-water mark. A periodic tick is raced against the stop signal (the
+/// sender is dropped when the load finishes), so the RSS is read on a real
+/// interval the whole time instead of blocking until the load is over.
 async fn sample_peak_rss(
     gateway_pid: i32,
     baseline_rss: Option<u64>,
@@ -730,12 +774,12 @@ async fn sample_peak_rss(
         if let Some(rss) = process_rss_kb(gateway_pid) {
             peak = peak.max(rss);
         }
-        // Block until a new value is sent or the sender is dropped (load done);
-        // an Err means the sender is gone, so stop sampling.
-        if stop.changed().await.is_err() {
-            break;
+        // Race a periodic tick against the stop signal: sample every tick while
+        // oha runs, and finish when the sender is dropped (the load is over).
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            _ = stop.changed() => break,
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     if peak == 0 {
         None
@@ -779,10 +823,10 @@ fn oha_version(oha_bin: &Path) -> Result<String, String> {
 }
 
 /// Render the sanitized aggregate report. Only the documented aggregate fields
-/// are printed; never raw records, bodies, keys, or exact token totals.
+/// are printed; never raw records, bodies, keys, exact token totals, or the oha
+/// executable path.
 #[allow(clippy::too_many_arguments)]
 fn render_report(
-    oha_bin: &Path,
     oha_version: &str,
     params: &SmokeParams,
     result: &OhaResult,
@@ -794,7 +838,7 @@ fn render_report(
 ) -> String {
     let kb = |v: Option<u64>| v.map(|x| x.to_string()).unwrap_or_else(|| "-".into());
     format!(
-        "debitmetre smoke: {}: oha={} (bin: {}) count={} concurrency={} response_bytes={} delay_ms={}\n\
+        "debitmetre smoke: {}: oha={} count={} concurrency={} response_bytes={} delay_ms={}\n\
          debitmetre smoke: completed={} success={} errors={}\n\
          debitmetre smoke: {}: rps={:.2} p50={:.2}ms p95={:.2}ms p99={:.2}ms\n\
          debitmetre smoke: {}: baseline={}kB peak={}kB end={}kB\n\
@@ -802,7 +846,6 @@ fn render_report(
          debitmetre smoke: PASS",
         REPORT_OHALINE,
         oha_version,
-        oha_bin.display(),
         params.count,
         params.concurrency,
         params.response_bytes,
