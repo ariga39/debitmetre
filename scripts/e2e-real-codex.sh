@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
 #
-# Real-Codex loopback self-test (issue #5).
+# Real-Codex loopback self-test (issues #5, #29, #31).
 #
 # Opt-in system acceptance: starts the current debitmetre binary on a loopback
 # port, points the operator's existing authenticated codex CLI at it through a
-# temporary model provider, gives it a tiny deterministic add(a,b) task in a
-# disposable git repository, runs an independent Python test, and reports only
-# sanitized pass/fail evidence for task success, canonical usage, model
+# temporary model provider, gives it a deterministic multi-file Python
+# diagnostic task (interacting loader/aggregate/CLI with two seeded defects;
+# issue #31) in a disposable git repository, proves the independent acceptance
+# command fails before Codex runs, runs the explicit installed `gpt-5.6-luna`
+# model, and proves the same acceptance command passes afterward while the task
+# README, fixture, and acceptance test stay byte-for-byte unchanged. It reports
+# only sanitized pass/fail evidence for task success, canonical usage, model
 # attribution, per-model summary, and diagnostic logs. It also explicitly
 # proves (from sanitized method/route/status lifecycle-log evidence) that the
 # Codex model-discovery `GET /v1/models` request was accepted and received a
@@ -22,7 +26,9 @@
 # and generated artifacts are never retained.
 #
 # Prerequisites: bash, cargo, codex, python3, jq, curl, git, sha256sum,
-# timeout, mktemp, head, base64, tr, cut, cat, tail, sleep, mkdir, rm, grep.
+# timeout, mktemp, head, base64, tr, cut, cat, tail, sleep, mkdir, rm, grep,
+# and the repository's own scripts/gen-diagnostic-task.sh and
+# scripts/check-diagnostic-task.sh task generators.
 #
 # Configurable via environment:
 #   DEBITMETRE_REAL_E2E       must be "1" to run (opt-in guard)
@@ -187,43 +193,34 @@ if [ "$ready" != "1" ]; then
     die start "gateway did not become ready on 127.0.0.1:$PORT"
 fi
 
-# --- disposable task repository with an independent Python test ------------
-mkdir -p "$WORKDIR/task-repo/src"
-cat > "$WORKDIR/task-repo/README.md" <<'EOF'
-# tiny add task
+# --- disposable task repository: deterministic multi-file diagnostic task --
+# The generated task (issue #31) has an interacting loader/aggregate/CLI chain
+# and two seeded defects; the acceptance command must fail before Codex runs
+# and pass after it. README.md, data/orders.txt, and test_report.py are
+# protected contract files; only the source modules under src/ may change.
+"$REPO_ROOT/scripts/gen-diagnostic-task.sh" "$WORKDIR/task-repo" >/dev/null
 
-Implement the missing `add` function in `src/add.py`.
+# --- honest red evidence before Codex runs ---------------------------------
+# The seeded defects must make the acceptance command fail first; if it passes,
+# the task did not reproduce a real defect and the rest of the run is vacuous.
+if "$REPO_ROOT/scripts/check-diagnostic-task.sh" "$WORKDIR/task-repo" \
+    > "$WORKDIR/red.out" 2>&1; then
+    die red "generated task acceptance passed before Codex ran (seeded defects not reproduced)"
+fi
+echo "debitmetre e2e: red evidence: independent acceptance failed before Codex ran"
 
-Independent success check (do not modify `test_add.py`):
-
-    python3 test_add.py
-EOF
-cat > "$WORKDIR/task-repo/test_add.py" <<'PY'
-import sys
-sys.path.insert(0, "src")
-from add import add
-
-cases = [(1, 2, 3), (-1, 1, 0), (2, 3, 5), (100, 200, 300)]
-for a, b, expected in cases:
-    got = add(a, b)
-    assert got == expected, f"add({a}, {b}) = {got}, expected {expected}"
-print("all add() tests passed")
-PY
-cat > "$WORKDIR/task-repo/src/add.py" <<'PY'
-def add(a, b):
-    raise NotImplementedError("implement add(a, b)")
-PY
-git -C "$WORKDIR/task-repo" init -q
-git -C "$WORKDIR/task-repo" add -A
-git -C "$WORKDIR/task-repo" -c user.name="debitmetre-e2e" -c user.email="e2e@example.com" commit -qm "task scaffold"
+# --- snapshot protected-file and source digests to prove repair provenance --
+PROTECTED_DIGEST="$( (cd "$WORKDIR/task-repo" && sha256sum README.md data/orders.txt test_report.py) )"
+SRC_DIGEST_BEFORE="$( (cd "$WORKDIR/task-repo" && sha256sum src/loader.py src/aggregate.py src/main.py) )"
 
 # --- run the authenticated codex CLI against the local gateway -------------
 # A fixed marker inside the prompt lets the log check prove that request
-# bodies never reach the gateway's diagnostic logs.
+# bodies never reach the gateway's diagnostic logs. The installed model is
+# chosen explicitly (issue #31).
 MARKER="DEBITMETRE-E2E-TASK-BODY-MARKER"
-PROMPT="$MARKER Implement the missing add function in src/add.py so that the independent check 'python3 test_add.py' passes. Do not modify test_add.py."
+PROMPT="$MARKER Repair the two seeded defects in src/loader.py and src/aggregate.py so that the order report is correct and the independent check 'python3 test_report.py' passes. Do not modify README.md, data/orders.txt, or test_report.py; fix only the source modules under src/."
 CODEX_EXIT=0
-if timeout "$TIMEOUT" codex exec -C "$WORKDIR/task-repo" \
+if timeout "$TIMEOUT" codex exec -m gpt-5.6-luna -C "$WORKDIR/task-repo" \
     -c 'model_providers.debitmetre.name="debitmetre"' \
     -c "model_providers.debitmetre.base_url=\"http://127.0.0.1:$PORT/v1\"" \
     -c 'model_providers.debitmetre.wire_api="responses"' \
@@ -239,9 +236,18 @@ else
     die codex "codex exec failed (exit $CODEX_EXIT after up to ${TIMEOUT}s)"
 fi
 
+# --- the repair must come from real source changes, not protected-file edits -
+if [ "$( (cd "$WORKDIR/task-repo" && sha256sum README.md data/orders.txt test_report.py) )" != "$PROTECTED_DIGEST" ]; then
+    die protected "a protected task file (README, fixture, or acceptance test) changed"
+fi
+if [ "$( (cd "$WORKDIR/task-repo" && sha256sum src/loader.py src/aggregate.py src/main.py) )" = "$SRC_DIGEST_BEFORE" ]; then
+    die source "no source module changed; the pass must come from real source repairs"
+fi
+
 # --- independent Python test (the task's ground truth) ---------------------
-if ! ( cd "$WORKDIR/task-repo" && python3 test_add.py ) > "$WORKDIR/test.out" 2>&1; then
-    die test "independent add(a,b) test failed: $(tail -1 "$WORKDIR/test.out" 2>/dev/null || true)"
+if ! "$REPO_ROOT/scripts/check-diagnostic-task.sh" "$WORKDIR/task-repo" \
+    > "$WORKDIR/test.out" 2>&1; then
+    die test "independent order-report test failed after Codex: $(tail -1 "$WORKDIR/test.out" 2>/dev/null || true)"
 fi
 
 # --- stop the gateway so the audit JSONL is fully flushed ------------------
@@ -438,12 +444,13 @@ fi
 # model names, exact token totals, credentials, the Codex transcript, or the
 # task body.
 RECORDS="$(jq --slurp 'length' "$WORKDIR/usage.jsonl")"
-echo "debitmetre e2e: PASS task: independent add(a,b) Python test passed"
+echo "debitmetre e2e: PASS task: independent order-report test passed after the gpt-5.6-luna repair"
 echo "debitmetre e2e: PASS audit: canonical schema_version=1 request record with required lifecycle fields, exactly seven usage counters, non-null model, and integral nonnegative nonzero usage"
 echo "debitmetre e2e: PASS summary: per-model summary groups match the accepted canonical audit records with nonzero totals"
 echo "debitmetre e2e: PASS models: GET /v1/models accepted with a 2xx upstream response (sanitized method/route/status evidence)"
 echo "debitmetre e2e: PASS logs: accepted/upstream lifecycle events; no raw meter key or task body marker"
 echo "debitmetre e2e: PASS artifacts: raw meter key absent from all generated artifacts"
+echo "debitmetre e2e: PASS protected: task README, fixture, and acceptance test byte-for-byte unchanged; only source modules changed"
 echo "debitmetre e2e: evidence: codex_exit=$CODEX_EXIT records=$RECORDS port=$PORT"
 echo "debitmetre e2e: evidence: summary_rows=$SUMMARY_ROWS has_nonzero=1"
 echo "debitmetre e2e: evidence: model_discovery=accepted_2xx"
