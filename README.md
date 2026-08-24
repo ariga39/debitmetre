@@ -96,6 +96,27 @@ Codex clients reach the gateway through the existing authenticated transparent p
 `POST /v1/responses` and `POST /v1/responses/compact` with an `X-Meter-Key` header. The upstream is
 fixed in code and redirects are never followed.
 
+### Real-Codex loopback self-test (opt-in)
+
+`scripts/e2e-real-codex.sh` is an operator opt-in system acceptance: it starts
+the current `debitmetre` binary on a loopback port, points your existing
+authenticated `codex` CLI at it through a temporary model provider, gives it a
+tiny deterministic `add(a,b)` task in a disposable git repository, runs an
+independent Python test, and prints only sanitized pass/fail evidence (task
+test, audit record shape, per-model summary totals, lifecycle logs). It never
+contacts a paid upstream beyond your own codex login, never inspects OAuth, and
+never prints or persists the synthetic X-Meter key. It is strictly opt-in and
+never runs under `cargo test` or CI:
+
+```sh
+DEBITMETRE_REAL_E2E=1 scripts/e2e-real-codex.sh
+```
+
+Prerequisites: `cargo`, `codex`, `python3`, `jq`, `curl`, `git`, `sha256sum`,
+`timeout`, `awk`. Without `DEBITMETRE_REAL_E2E=1` the script is a safe no-op.
+The script header lists the configurable loopback port, step timeout, meter
+key, and `DEBITMETRE_E2E_KEEP=1` artifact-retention flag.
+
 ### Process-level test
 
 The process-level test starts the built binary with synthetic configuration, observes readiness,
