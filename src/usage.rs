@@ -487,10 +487,12 @@ fn extract_raw_usage(usage: &serde_json::Value) -> RawUsage {
 fn canonicalize(raw: RawUsage) -> (Usage, AccountingQuality) {
     let (uncached, quality) = match (raw.input_total, raw.cache_read, raw.cache_write) {
         (Some(input), Some(read), Some(write)) => {
-            if input >= read.saturating_add(write) {
-                (Some(input - read - write), AccountingQuality::Complete)
-            } else {
-                (None, AccountingQuality::Inconsistent)
+            match read
+                .checked_add(write)
+                .and_then(|sum| input.checked_sub(sum))
+            {
+                Some(uncached) => (Some(uncached), AccountingQuality::Complete),
+                None => (None, AccountingQuality::Inconsistent),
             }
         }
         _ => (None, AccountingQuality::Partial),
