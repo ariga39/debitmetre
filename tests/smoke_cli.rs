@@ -250,3 +250,69 @@ fn failing_oha_still_releases_the_gateway_port() {
         "gateway loopback port must be released after the smoke command exits"
     );
 }
+
+/// A fake oha that returns syntactically valid oha JSON but performs zero
+/// requests (successRate 1.0, empty status/error distributions) must fail the
+/// smoke command: it must never reach PASS with zero audit records, and the
+/// failure must be prompt (validated before waiting on the audit file, not after
+/// an audit-drain timeout).
+#[cfg(unix)]
+#[test]
+fn fake_oha_reporting_zero_requests_fails_promptly() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Instant;
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let fake_oha = dir.path().join("fake-oha");
+    std::fs::write(
+        &fake_oha,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ]; then\n\
+         \x20 echo \"oha 9.9.9\"\n\
+         \x20 exit 0\n\
+         fi\n\
+         cat <<'JSON'\n\
+         {\"summary\":{\"successRate\":1.0,\"requestsPerSec\":0.0},\"latencyPercentiles\":{\"p50\":0.0,\"p95\":0.0,\"p99\":0.0},\"statusCodeDistribution\":{},\"errorDistribution\":{}}\n\
+         JSON\n\
+         exit 0\n",
+    )
+    .expect("write fake oha");
+    std::fs::set_permissions(&fake_oha, std::fs::Permissions::from_mode(0o755))
+        .expect("make fake oha executable");
+
+    let start = Instant::now();
+    let output = Command::new(env!("CARGO_BIN_EXE_debitmetre"))
+        .arg("smoke")
+        .arg("--count")
+        .arg("5")
+        .arg("--concurrency")
+        .arg("2")
+        .arg("--port")
+        .arg("0")
+        .arg("--oha")
+        .arg(&fake_oha)
+        .env("OHA_BIN", &fake_oha)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run the debitmetre binary");
+    let elapsed = start.elapsed();
+
+    // A load generator that accounted for zero of the requested requests must
+    // not reach PASS.
+    assert!(
+        !output.status.success(),
+        "zero-request oha must make the smoke command fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("accounting") && stderr.contains("mismatch"),
+        "failure names the load accounting mismatch, got: {stderr}"
+    );
+    // Validated before the audit wait, so it must fail promptly and never spend
+    // the audit-drain timeout waiting for records that will never arrive.
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "must fail promptly, took {elapsed:?}"
+    );
+}

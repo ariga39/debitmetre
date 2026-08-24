@@ -464,17 +464,18 @@ pub async fn run(params: &SmokeParams) -> Result<String, String> {
     }
     let end_rss = process_rss_kb(gateway_pid);
 
-    // Let the gateway's background audit writer drain, then reconcile. On any
-    // error return from here on, the guard still terminates and reaps.
-    let Some((accepted, metered)) = wait_audit_count(&usage_file, oha_result.completed).await
-    else {
+    // Wait for the gateway's background audit writer to drain (a writer
+    // barrier), then shut the gateway and mock down. On any error return from
+    // here on, the guard still terminates and reaps.
+    let Some((_, _)) = wait_audit_count(&usage_file, oha_result.completed).await else {
         return Err("audit records fell short of completed requests; metering was lost".into());
     };
-
-    // Stop the gateway and mock now that the load and audit drain are complete.
     procs.shutdown();
 
-    // Reconcile: accepted must equal completed, and every accepted must be metered.
+    // Final reconciliation happens after shutdown: reread the audit file so the
+    // report reflects the post-cleanup state, and compare those final values
+    // against the load result.
+    let (accepted, metered) = count_audit(&usage_file)?;
     if accepted != oha_result.completed {
         return Err(format!(
             "audit accepted={accepted} != oha completed={} (mismatch)",
@@ -570,6 +571,16 @@ async fn run_oha_and_sample(
     }
     if !result.all_2xx {
         return Err("oha reported non-2xx responses; load failed".into());
+    }
+    // The load generator must account for exactly the requested workload: a
+    // result whose completed+errors differ from the requested count (e.g. a fake
+    // oha that reports success with zero requests) is a load failure, validated
+    // here before any audit wait so it fails promptly.
+    if result.completed.saturating_add(result.errors) != params.count {
+        return Err(format!(
+            "oha accounting mismatch: completed={} errors={} != requested count={}",
+            result.completed, result.errors, params.count
+        ));
     }
 
     Ok((result, peak_rss))
