@@ -477,39 +477,44 @@ async fn genuine_json_with_blank_line_whitespace_is_forwarded_and_records_known_
     assert_eq!(usage["total"], 17);
 }
 
-/// Build a synthetic Responses JSON body whose `output` text carries a padding
-/// string, used to make the body exceed the bounded observers' caps while the
-/// token facts stay at known synthetic values.
-fn padded_json_body(pad_bytes: usize, id: &str) -> String {
-    let pad = "x".repeat(pad_bytes);
-    format!(
-        "{{\"id\":\"{id}\",\"model\":\"synthetic-model-001\",\"output\":[{{\"type\":\"output_text\",\"text\":\"{pad}\"}}],\"usage\":{{\"input_tokens\":12,\"output_tokens\":5,\"total_tokens\":17}}}}"
-    )
-}
+/// A synthetic Responses SSE terminal event whose event-data JSON carries no
+/// `model` field (issue #20 clarified decision): the pinned official Codex
+/// client reports the model via the `openai-model` response header, so a valid
+/// header must supply a non-null audit model even though the terminal body omits
+/// it. Token counts are the known ones from `STREAMING_RESPONSE_FIXTURE`.
+const HEADER_MODEL_SSE_FIXTURE: &str = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-header-model\",\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":4,\"cache_write_tokens\":2},\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":2},\"total_tokens\":17}}}\n\n";
 
-/// A complete non-streaming JSON body larger than the bounded JSON observer cap
-/// (DESIGN.md §4, issue #20 PR review): the response reaches a clean EOF and is
-/// metered as `completed`, not `upstream_interrupted`, even though the bounded
-/// observer cannot parse it. The caller-visible bytes stay unchanged.
+/// A synthetic non-streaming Responses JSON body without a `model` field: a
+/// valid `openai-model` response header must supply the audit model.
+const HEADER_MODEL_JSON_FIXTURE: &str = "{\"id\":\"resp-header-json\",\"object\":\"response\",\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":4,\"cache_write_tokens\":2},\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":2},\"total_tokens\":17}}";
+
+/// A synthetic Responses SSE terminal event carrying a body `model` that
+/// conflicts with the `openai-model` response header (issue #20 clarified
+/// decision): the server-reported header is primary and wins deterministically.
+const HEADER_WINS_SSE_FIXTURE: &str = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-header-conflict\",\"model\":\"synthetic-body-model-001\",\"usage\":{\"input_tokens\":12,\"input_tokens_details\":{\"cached_tokens\":4,\"cache_write_tokens\":2},\"output_tokens\":5,\"output_tokens_details\":{\"reasoning_tokens\":2},\"total_tokens\":17}}}\n\n";
+
 #[tokio::test]
-async fn large_genuine_json_body_is_completed_with_missing_usage() {
+async fn openai_model_header_supplies_model_for_terminal_sse_without_body_model() {
     let upstream = FakeUpstream::default();
     let fake_app = Router::new()
         .route("/responses", post(canned_upstream_handler))
         .with_state(upstream.clone());
     let upstream_url = spawn(fake_app).await;
 
-    let body = padded_json_body(80 * 1024, "resp-large-json");
     upstream.queue.lock().unwrap().push(CannedResponse {
         status: StatusCode::OK,
         headers: vec![
-            ("content-type".to_string(), "application/json".to_string()),
+            ("content-type".to_string(), "text/event-stream".to_string()),
+            (
+                "openai-model".to_string(),
+                "synthetic-header-model-001".to_string(),
+            ),
             (
                 "x-codex-semantic".to_string(),
-                "large-json-semantic-01".to_string(),
+                "header-model-sse-semantic-01".to_string(),
             ),
         ],
-        body: body.as_bytes().to_vec(),
+        body: HEADER_MODEL_SSE_FIXTURE.as_bytes().to_vec(),
     });
 
     let usage_dir = tempfile::TempDir::new().unwrap();
@@ -536,10 +541,10 @@ async fn large_genuine_json_body_is_completed_with_missing_usage() {
     assert_eq!(
         response
             .headers()
-            .get("x-codex-semantic")
+            .get("openai-model")
             .and_then(|v| v.to_str().ok()),
-        Some("large-json-semantic-01"),
-        "caller-visible upstream headers preserved"
+        Some("synthetic-header-model-001"),
+        "the upstream openai-model header is preserved for the caller"
     );
     assert_eq!(
         response
@@ -547,22 +552,187 @@ async fn large_genuine_json_body_is_completed_with_missing_usage() {
             .await
             .expect("gateway response body")
             .as_ref(),
-        body.as_bytes(),
-        "caller-visible response bytes are byte-for-byte the upstream JSON body"
+        HEADER_MODEL_SSE_FIXTURE.as_bytes(),
+        "caller-visible response bytes are byte-for-byte the upstream SSE"
     );
 
     let record = wait_for_jsonl_record(&usage_file).await;
     assert_eq!(record["kind"], "request");
     assert_eq!(record["operation"], "response");
+    assert_eq!(record["machine_id"], "machine-a");
     assert_eq!(record["upstream_status"], 200);
+    assert_eq!(record["outcome"], "completed");
     assert_eq!(
-        record["outcome"], "completed",
-        "a fully received non-streaming body is completed, never upstream_interrupted \
-         just because the bounded observer could not parse it"
+        record["model"], "synthetic-header-model-001",
+        "the valid openai-model header is the server-reported model when the terminal body omits it"
     );
-    assert!(record["usage"].is_null());
-    assert_eq!(record["accounting_quality"], "unavailable");
-    assert_eq!(record["metering_error"], "missing_usage");
+    assert_eq!(record["accounting_quality"], "complete");
+    assert!(record["metering_error"].is_null());
+
+    let usage = &record["usage"];
+    assert_eq!(usage["input_total"], 12);
+    assert_eq!(usage["uncached"], 6);
+    assert_eq!(usage["cache_read"], 4);
+    assert_eq!(usage["cache_write"], 2);
+    assert_eq!(usage["output_total"], 5);
+    assert_eq!(usage["reasoning"], 2);
+    assert_eq!(usage["total"], 17);
+}
+
+#[tokio::test]
+async fn openai_model_header_supplies_model_for_genuine_json_without_body_model() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                "openai-model".to_string(),
+                "synthetic-header-model-001".to_string(),
+            ),
+            (
+                "x-codex-semantic".to_string(),
+                "header-model-json-semantic-01".to_string(),
+            ),
+        ],
+        body: HEADER_MODEL_JSON_FIXTURE.as_bytes().to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .bytes()
+            .await
+            .expect("gateway response body")
+            .as_ref(),
+        HEADER_MODEL_JSON_FIXTURE.as_bytes(),
+        "caller-visible response bytes are byte-for-byte the upstream JSON"
+    );
+
+    let record = wait_for_jsonl_record(&usage_file).await;
+    assert_eq!(record["kind"], "request");
+    assert_eq!(record["operation"], "response");
+    assert_eq!(record["machine_id"], "machine-a");
+    assert_eq!(record["upstream_status"], 200);
+    assert_eq!(record["outcome"], "completed");
+    assert_eq!(
+        record["model"], "synthetic-header-model-001",
+        "the valid openai-model header is the server-reported model when the JSON body omits it"
+    );
+    assert_eq!(record["accounting_quality"], "complete");
+    assert!(record["metering_error"].is_null());
+
+    let usage = &record["usage"];
+    assert_eq!(usage["input_total"], 12);
+    assert_eq!(usage["uncached"], 6);
+    assert_eq!(usage["cache_read"], 4);
+    assert_eq!(usage["cache_write"], 2);
+    assert_eq!(usage["output_total"], 5);
+    assert_eq!(usage["reasoning"], 2);
+    assert_eq!(usage["total"], 17);
+}
+
+#[tokio::test]
+async fn openai_model_header_wins_over_conflicting_terminal_body_model() {
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![
+            ("content-type".to_string(), "text/event-stream".to_string()),
+            (
+                "openai-model".to_string(),
+                "synthetic-header-model-001".to_string(),
+            ),
+            (
+                "x-codex-semantic".to_string(),
+                "header-wins-semantic-01".to_string(),
+            ),
+        ],
+        body: HEADER_WINS_SSE_FIXTURE.as_bytes().to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body("opaque-request-body-42")
+        .send()
+        .await
+        .expect("caller reaches gateway");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .bytes()
+            .await
+            .expect("gateway response body")
+            .as_ref(),
+        HEADER_WINS_SSE_FIXTURE.as_bytes(),
+        "caller-visible response bytes are byte-for-byte the upstream SSE"
+    );
+
+    let record = wait_for_jsonl_record(&usage_file).await;
+    assert_eq!(record["kind"], "request");
+    assert_eq!(record["operation"], "response");
+    assert_eq!(record["machine_id"], "machine-a");
+    assert_eq!(record["upstream_status"], 200);
+    assert_eq!(record["outcome"], "completed");
+    assert_eq!(
+        record["model"], "synthetic-header-model-001",
+        "the openai-model header deterministically wins over a conflicting terminal-body model"
+    );
+    assert_eq!(record["accounting_quality"], "complete");
+    assert!(record["metering_error"].is_null());
+
+    let usage = &record["usage"];
+    assert_eq!(usage["input_total"], 12);
+    assert_eq!(usage["uncached"], 6);
+    assert_eq!(usage["cache_read"], 4);
+    assert_eq!(usage["cache_write"], 2);
+    assert_eq!(usage["output_total"], 5);
+    assert_eq!(usage["reasoning"], 2);
+    assert_eq!(usage["total"], 17);
 }
 
 /// A complete malformed non-streaming JSON body (issue #20 PR review): clean EOF
@@ -636,575 +806,6 @@ async fn malformed_json_body_is_completed_with_missing_usage() {
         record["outcome"], "completed",
         "a malformed non-streaming body that reached clean EOF is completed, \
          not upstream_interrupted"
-    );
-    assert!(record["usage"].is_null());
-    assert_eq!(record["accounting_quality"], "unavailable");
-    assert_eq!(record["metering_error"], "missing_usage");
-}
-
-/// A terminal SSE event larger than the bounded SSE observer cap (DESIGN.md
-/// §4.1, issue #20 PR review): the terminal outcome (`completed`) is preserved,
-/// and the request records `metering_error=event_too_large`, never
-/// `upstream_interrupted`. The caller-visible bytes stay unchanged.
-#[tokio::test]
-async fn oversized_terminal_sse_event_is_completed_with_event_too_large() {
-    let upstream = FakeUpstream::default();
-    let fake_app = Router::new()
-        .route("/responses", post(canned_upstream_handler))
-        .with_state(upstream.clone());
-    let upstream_url = spawn(fake_app).await;
-
-    let pad = "x".repeat(256 * 1024);
-    let body = format!(
-        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-oversized\",\"output\":[{{\"type\":\"output_text\",\"text\":\"{pad}\"}}],\"usage\":{{\"input_tokens\":12,\"output_tokens\":5,\"total_tokens\":17}}}}}}\n\n"
-    );
-    upstream.queue.lock().unwrap().push(CannedResponse {
-        status: StatusCode::OK,
-        headers: vec![
-            ("content-type".to_string(), "text/event-stream".to_string()),
-            (
-                "x-codex-semantic".to_string(),
-                "oversized-terminal-semantic-01".to_string(),
-            ),
-        ],
-        body: body.as_bytes().to_vec(),
-    });
-
-    let usage_dir = tempfile::TempDir::new().unwrap();
-    let usage_file = usage_dir.path().join("usage.jsonl");
-    let machine_keys =
-        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
-    let gateway = Gateway::for_tests(
-        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
-        machine_keys,
-        &usage_file,
-    );
-    let gateway_url = spawn(gateway.router()).await;
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!("{gateway_url}/v1/responses"))
-        .header("x-meter-key", "test-meter-key-machine-a")
-        .body("opaque-request-body-42")
-        .send()
-        .await
-        .expect("caller reaches gateway");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("x-codex-semantic")
-            .and_then(|v| v.to_str().ok()),
-        Some("oversized-terminal-semantic-01"),
-        "caller-visible upstream headers preserved"
-    );
-    assert_eq!(
-        response
-            .bytes()
-            .await
-            .expect("gateway response body")
-            .as_ref(),
-        body.as_bytes(),
-        "caller-visible response bytes are byte-for-byte the upstream SSE body"
-    );
-
-    let record = wait_for_jsonl_record(&usage_file).await;
-    assert_eq!(record["kind"], "request");
-    assert_eq!(record["operation"], "response");
-    assert_eq!(record["upstream_status"], 200);
-    assert_eq!(
-        record["outcome"], "completed",
-        "an oversized terminal event keeps its supported terminal outcome"
-    );
-    assert!(record["usage"].is_null());
-    assert_eq!(record["accounting_quality"], "unavailable");
-    assert_eq!(record["metering_error"], "event_too_large");
-}
-
-/// An oversized non-terminal SSE event whose data payload literally contains the
-/// strings `response.completed` and `response.incomplete` (issue #20 PR review):
-/// payload text must never establish a terminal outcome. After a complete event
-/// delimiter and clean EOF the audit is `upstream_interrupted` with `missing_usage`.
-#[tokio::test]
-async fn oversized_nonterminal_sse_payload_text_does_not_establish_terminal() {
-    let upstream = FakeUpstream::default();
-    let fake_app = Router::new()
-        .route("/responses", post(canned_upstream_handler))
-        .with_state(upstream.clone());
-    let upstream_url = spawn(fake_app).await;
-
-    let pad = format!(
-        "response.completed response.incomplete {}",
-        "x".repeat(256 * 1024)
-    );
-    let body = format!(
-        "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"{pad}\"}}\n\n"
-    );
-    upstream.queue.lock().unwrap().push(CannedResponse {
-        status: StatusCode::OK,
-        headers: vec![
-            ("content-type".to_string(), "text/event-stream".to_string()),
-            (
-                "x-codex-semantic".to_string(),
-                "oversized-nonterminal-semantic-01".to_string(),
-            ),
-        ],
-        body: body.as_bytes().to_vec(),
-    });
-
-    let usage_dir = tempfile::TempDir::new().unwrap();
-    let usage_file = usage_dir.path().join("usage.jsonl");
-    let machine_keys =
-        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
-    let gateway = Gateway::for_tests(
-        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
-        machine_keys,
-        &usage_file,
-    );
-    let gateway_url = spawn(gateway.router()).await;
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!("{gateway_url}/v1/responses"))
-        .header("x-meter-key", "test-meter-key-machine-a")
-        .body("opaque-request-body-42")
-        .send()
-        .await
-        .expect("caller reaches gateway");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("x-codex-semantic")
-            .and_then(|v| v.to_str().ok()),
-        Some("oversized-nonterminal-semantic-01"),
-        "caller-visible upstream headers preserved"
-    );
-    assert_eq!(
-        response
-            .bytes()
-            .await
-            .expect("gateway response body")
-            .as_ref(),
-        body.as_bytes(),
-        "caller-visible response bytes are byte-for-byte the upstream SSE body"
-    );
-
-    let record = wait_for_jsonl_record(&usage_file).await;
-    assert_eq!(record["kind"], "request");
-    assert_eq!(record["operation"], "response");
-    assert_eq!(record["upstream_status"], 200);
-    assert_eq!(
-        record["outcome"], "upstream_interrupted",
-        "terminal names inside a non-terminal event's data payload must not establish a terminal outcome"
-    );
-    assert!(record["usage"].is_null());
-    assert_eq!(record["accounting_quality"], "unavailable");
-    assert_eq!(record["metering_error"], "missing_usage");
-}
-
-/// An oversized event that starts with an actual supported terminal `event:`
-/// field but is truncated at clean EOF before the SSE event delimiter (issue #20
-/// PR review): a partial event is not delivered, so it must not count as a
-/// delivered terminal; the audit is `upstream_interrupted`, never
-/// `completed`/`incomplete`/`event_too_large`.
-#[tokio::test]
-async fn oversized_terminal_field_truncated_before_delimiter_is_upstream_interrupted() {
-    let upstream = FakeUpstream::default();
-    let fake_app = Router::new()
-        .route("/responses", post(canned_upstream_handler))
-        .with_state(upstream.clone());
-    let upstream_url = spawn(fake_app).await;
-
-    let pad = "x".repeat(256 * 1024);
-    let body = format!(
-        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-truncated\",\"output\":[{{\"type\":\"output_text\",\"text\":\"{pad}\"}}]}}"
-    );
-    upstream.queue.lock().unwrap().push(CannedResponse {
-        status: StatusCode::OK,
-        headers: vec![
-            ("content-type".to_string(), "text/event-stream".to_string()),
-            (
-                "x-codex-semantic".to_string(),
-                "truncated-terminal-semantic-01".to_string(),
-            ),
-        ],
-        body: body.as_bytes().to_vec(),
-    });
-
-    let usage_dir = tempfile::TempDir::new().unwrap();
-    let usage_file = usage_dir.path().join("usage.jsonl");
-    let machine_keys =
-        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
-    let gateway = Gateway::for_tests(
-        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
-        machine_keys,
-        &usage_file,
-    );
-    let gateway_url = spawn(gateway.router()).await;
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!("{gateway_url}/v1/responses"))
-        .header("x-meter-key", "test-meter-key-machine-a")
-        .body("opaque-request-body-42")
-        .send()
-        .await
-        .expect("caller reaches gateway");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("x-codex-semantic")
-            .and_then(|v| v.to_str().ok()),
-        Some("truncated-terminal-semantic-01"),
-        "caller-visible upstream headers preserved"
-    );
-    assert_eq!(
-        response
-            .bytes()
-            .await
-            .expect("gateway response body")
-            .as_ref(),
-        body.as_bytes(),
-        "caller-visible response bytes are byte-for-byte the upstream SSE body"
-    );
-
-    let record = wait_for_jsonl_record(&usage_file).await;
-    assert_eq!(record["kind"], "request");
-    assert_eq!(record["operation"], "response");
-    assert_eq!(record["upstream_status"], 200);
-    assert_eq!(
-        record["outcome"], "upstream_interrupted",
-        "an oversized terminal event truncated before its delimiter is not a delivered terminal"
-    );
-    assert!(record["usage"].is_null());
-    assert_eq!(record["accounting_quality"], "unavailable");
-    assert_eq!(record["metering_error"], "missing_usage");
-}
-
-/// An oversized event whose early `event: response.completed` field is followed,
-/// after more than `SSE_EVENT_CAP` data bytes, by a later line-start
-/// `event: response.output_text.delta` field before the complete delimiter
-/// (issue #20 PR review): SSE last-field-wins applies across the whole event,
-/// so clean EOF has no supported terminal and the audit is `upstream_interrupted`
-/// with `missing_usage`.
-#[tokio::test]
-async fn oversized_event_last_event_field_wins_across_retained_cap() {
-    let upstream = FakeUpstream::default();
-    let fake_app = Router::new()
-        .route("/responses", post(canned_upstream_handler))
-        .with_state(upstream.clone());
-    let upstream_url = spawn(fake_app).await;
-
-    let pad = "x".repeat(256 * 1024);
-    let body = format!(
-        "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"output\":[{{\"type\":\"output_text\",\"text\":\"{pad}\"}}]}}}}\nevent: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"synthetic\"}}\n\n"
-    );
-    upstream.queue.lock().unwrap().push(CannedResponse {
-        status: StatusCode::OK,
-        headers: vec![
-            ("content-type".to_string(), "text/event-stream".to_string()),
-            (
-                "x-codex-semantic".to_string(),
-                "last-field-wins-semantic-01".to_string(),
-            ),
-        ],
-        body: body.as_bytes().to_vec(),
-    });
-
-    let usage_dir = tempfile::TempDir::new().unwrap();
-    let usage_file = usage_dir.path().join("usage.jsonl");
-    let machine_keys =
-        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
-    let gateway = Gateway::for_tests(
-        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
-        machine_keys,
-        &usage_file,
-    );
-    let gateway_url = spawn(gateway.router()).await;
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!("{gateway_url}/v1/responses"))
-        .header("x-meter-key", "test-meter-key-machine-a")
-        .body("opaque-request-body-42")
-        .send()
-        .await
-        .expect("caller reaches gateway");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("x-codex-semantic")
-            .and_then(|v| v.to_str().ok()),
-        Some("last-field-wins-semantic-01"),
-        "caller-visible upstream headers preserved"
-    );
-    assert_eq!(
-        response
-            .bytes()
-            .await
-            .expect("gateway response body")
-            .as_ref(),
-        body.as_bytes(),
-        "caller-visible response bytes are byte-for-byte the upstream SSE body"
-    );
-
-    let record = wait_for_jsonl_record(&usage_file).await;
-    assert_eq!(record["kind"], "request");
-    assert_eq!(record["operation"], "response");
-    assert_eq!(record["upstream_status"], 200);
-    assert_eq!(
-        record["outcome"], "upstream_interrupted",
-        "the last event: field in the oversized event must win, even beyond the retained cap"
-    );
-    assert!(record["usage"].is_null());
-    assert_eq!(record["accounting_quality"], "unavailable");
-    assert_eq!(record["metering_error"], "missing_usage");
-}
-
-/// An oversized event with an early nonterminal field and, after more than
-/// `SSE_EVENT_CAP` data bytes, a later line-start `event: response.completed`
-/// field before the complete delimiter (issue #20 PR review): the last `event:`
-/// field wins even beyond the retained cap, so the audit is `completed` with
-/// `event_too_large`.
-#[tokio::test]
-async fn oversized_event_terminal_field_after_retained_cap_is_completed() {
-    let upstream = FakeUpstream::default();
-    let fake_app = Router::new()
-        .route("/responses", post(canned_upstream_handler))
-        .with_state(upstream.clone());
-    let upstream_url = spawn(fake_app).await;
-
-    let pad = "x".repeat(256 * 1024);
-    let body = format!(
-        "event: response.output_text.delta\ndata: {{\"type\":\"response.output_text.delta\",\"delta\":\"{pad}\"}}\nevent: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp-late\"}}}}\n\n"
-    );
-    upstream.queue.lock().unwrap().push(CannedResponse {
-        status: StatusCode::OK,
-        headers: vec![
-            ("content-type".to_string(), "text/event-stream".to_string()),
-            (
-                "x-codex-semantic".to_string(),
-                "late-terminal-semantic-01".to_string(),
-            ),
-        ],
-        body: body.as_bytes().to_vec(),
-    });
-
-    let usage_dir = tempfile::TempDir::new().unwrap();
-    let usage_file = usage_dir.path().join("usage.jsonl");
-    let machine_keys =
-        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
-    let gateway = Gateway::for_tests(
-        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
-        machine_keys,
-        &usage_file,
-    );
-    let gateway_url = spawn(gateway.router()).await;
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!("{gateway_url}/v1/responses"))
-        .header("x-meter-key", "test-meter-key-machine-a")
-        .body("opaque-request-body-42")
-        .send()
-        .await
-        .expect("caller reaches gateway");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("x-codex-semantic")
-            .and_then(|v| v.to_str().ok()),
-        Some("late-terminal-semantic-01"),
-        "caller-visible upstream headers preserved"
-    );
-    assert_eq!(
-        response
-            .bytes()
-            .await
-            .expect("gateway response body")
-            .as_ref(),
-        body.as_bytes(),
-        "caller-visible response bytes are byte-for-byte the upstream SSE body"
-    );
-
-    let record = wait_for_jsonl_record(&usage_file).await;
-    assert_eq!(record["kind"], "request");
-    assert_eq!(record["operation"], "response");
-    assert_eq!(record["upstream_status"], 200);
-    assert_eq!(
-        record["outcome"], "completed",
-        "the terminal event: field after the retained cap must still establish the terminal outcome"
-    );
-    assert!(record["usage"].is_null());
-    assert_eq!(record["accounting_quality"], "unavailable");
-    assert_eq!(record["metering_error"], "event_too_large");
-}
-
-/// An oversized event whose `event:` field has a trailing U+0020 after the name
-/// (issue #20 PR review): SSE field whitespace removes at most one leading space
-/// after the colon and preserves trailing whitespace, so
-/// `event: response.completed ` is not a supported terminal and the audit is
-/// `upstream_interrupted` with `missing_usage`.
-#[tokio::test]
-async fn oversized_event_field_trailing_space_is_not_terminal() {
-    let upstream = FakeUpstream::default();
-    let fake_app = Router::new()
-        .route("/responses", post(canned_upstream_handler))
-        .with_state(upstream.clone());
-    let upstream_url = spawn(fake_app).await;
-
-    let pad = "x".repeat(256 * 1024);
-    let body = format!(
-        "event: response.completed \ndata: {{\"type\":\"response.completed\",\"response\":{{\"output\":[{{\"type\":\"output_text\",\"text\":\"{pad}\"}}]}}}}\n\n"
-    );
-    upstream.queue.lock().unwrap().push(CannedResponse {
-        status: StatusCode::OK,
-        headers: vec![
-            ("content-type".to_string(), "text/event-stream".to_string()),
-            (
-                "x-codex-semantic".to_string(),
-                "trailing-space-semantic-01".to_string(),
-            ),
-        ],
-        body: body.as_bytes().to_vec(),
-    });
-
-    let usage_dir = tempfile::TempDir::new().unwrap();
-    let usage_file = usage_dir.path().join("usage.jsonl");
-    let machine_keys =
-        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
-    let gateway = Gateway::for_tests(
-        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
-        machine_keys,
-        &usage_file,
-    );
-    let gateway_url = spawn(gateway.router()).await;
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!("{gateway_url}/v1/responses"))
-        .header("x-meter-key", "test-meter-key-machine-a")
-        .body("opaque-request-body-42")
-        .send()
-        .await
-        .expect("caller reaches gateway");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("x-codex-semantic")
-            .and_then(|v| v.to_str().ok()),
-        Some("trailing-space-semantic-01"),
-        "caller-visible upstream headers preserved"
-    );
-    assert_eq!(
-        response
-            .bytes()
-            .await
-            .expect("gateway response body")
-            .as_ref(),
-        body.as_bytes(),
-        "caller-visible response bytes are byte-for-byte the upstream SSE body"
-    );
-
-    let record = wait_for_jsonl_record(&usage_file).await;
-    assert_eq!(record["kind"], "request");
-    assert_eq!(record["operation"], "response");
-    assert_eq!(record["upstream_status"], 200);
-    assert_eq!(
-        record["outcome"], "upstream_interrupted",
-        "a trailing-space event name is not a supported terminal"
-    );
-    assert!(record["usage"].is_null());
-    assert_eq!(record["accounting_quality"], "unavailable");
-    assert_eq!(record["metering_error"], "missing_usage");
-}
-
-/// An oversized event field with no optional space after the colon but a
-/// trailing U+0020 after the name — `event:response.completed ` (issue #20 PR
-/// review): SSE removes at most one leading space immediately after the colon,
-/// so the trailing space is preserved, the name is unsupported, and the audit
-/// stays `upstream_interrupted` with `missing_usage`.
-#[tokio::test]
-async fn oversized_event_field_no_colon_space_with_trailing_space_is_not_terminal() {
-    let upstream = FakeUpstream::default();
-    let fake_app = Router::new()
-        .route("/responses", post(canned_upstream_handler))
-        .with_state(upstream.clone());
-    let upstream_url = spawn(fake_app).await;
-
-    let pad = "x".repeat(256 * 1024);
-    let body = format!(
-        "event:response.completed \ndata: {{\"type\":\"response.completed\",\"response\":{{\"output\":[{{\"type\":\"output_text\",\"text\":\"{pad}\"}}]}}}}\n\n"
-    );
-    upstream.queue.lock().unwrap().push(CannedResponse {
-        status: StatusCode::OK,
-        headers: vec![
-            ("content-type".to_string(), "text/event-stream".to_string()),
-            (
-                "x-codex-semantic".to_string(),
-                "no-colon-space-trailing-semantic-01".to_string(),
-            ),
-        ],
-        body: body.as_bytes().to_vec(),
-    });
-
-    let usage_dir = tempfile::TempDir::new().unwrap();
-    let usage_file = usage_dir.path().join("usage.jsonl");
-    let machine_keys =
-        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
-    let gateway = Gateway::for_tests(
-        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
-        machine_keys,
-        &usage_file,
-    );
-    let gateway_url = spawn(gateway.router()).await;
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post(format!("{gateway_url}/v1/responses"))
-        .header("x-meter-key", "test-meter-key-machine-a")
-        .body("opaque-request-body-42")
-        .send()
-        .await
-        .expect("caller reaches gateway");
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("x-codex-semantic")
-            .and_then(|v| v.to_str().ok()),
-        Some("no-colon-space-trailing-semantic-01"),
-        "caller-visible upstream headers preserved"
-    );
-    assert_eq!(
-        response
-            .bytes()
-            .await
-            .expect("gateway response body")
-            .as_ref(),
-        body.as_bytes(),
-        "caller-visible response bytes are byte-for-byte the upstream SSE body"
-    );
-
-    let record = wait_for_jsonl_record(&usage_file).await;
-    assert_eq!(record["kind"], "request");
-    assert_eq!(record["operation"], "response");
-    assert_eq!(record["upstream_status"], 200);
-    assert_eq!(
-        record["outcome"], "upstream_interrupted",
-        "a trailing space without a colon space is preserved and is not a supported terminal"
     );
     assert!(record["usage"].is_null());
     assert_eq!(record["accounting_quality"], "unavailable");

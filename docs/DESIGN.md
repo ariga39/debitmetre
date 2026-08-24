@@ -29,7 +29,7 @@ It does not probe OpenAI, does not leak any configuration content, and does not 
 - Unknown paths return 404; wrong methods on known paths return 405; neither is ever forwarded to the upstream.
 - The production upstream is fixed in code and cannot be changed via configuration (SSRF prevention); following upstream redirects is forbidden.
 - Tests may inject a fake upstream at process/module construction time; no such option exists in production configuration.
-- Both SSE streaming and non-streaming JSON responses are transparently supported. Content-Type alone is not authoritative for Responses framing: a body labeled `application/json` can still be SSE-framed (the Codex client feeds the response bytes to its own SSE parser regardless of Content-Type). The extractor runs two bounded observers over the same stream — an SSE observer and a non-streaming JSON observer — and selects the grounded terminal result: a terminal `response.completed` / `response.incomplete` SSE event wins, otherwise the complete non-streaming JSON body wins. Both observers stay bounded; the whole body is never accumulated.
+- Both SSE streaming and non-streaming JSON responses are transparently supported. Content-Type alone is not authoritative for Responses framing: a body labeled `application/json` can still be SSE-framed (the Codex client feeds the response bytes to its own SSE parser regardless of Content-Type). The observer mirrors the forwarded bytes and, at lifecycle finalization, frames the whole mirror as SSE with the same library the pinned Codex client uses (`eventsource-stream` 0.2.3); a supported terminal `response.completed` / `response.incomplete` event wins, otherwise the complete non-streaming JSON body wins (a body that never framed as SSE).
 
 ### 2.1 Semantic transparency boundary
 
@@ -62,7 +62,7 @@ Request headers follow an explicit stripping policy that prioritizes compatibili
 ## 4. Metering and token accounting
 
 - The request body is forwarded directly as an opaque stream: no decompression, no parsing, no caching.
-- `model` is taken from the response terminal object; if it cannot be obtained, record null, which does not affect forwarding.
+- `model` is the valid `openai-model` response header when present (the pinned Codex client reports it as its server model); the terminal-body `model` is only the fallback. If neither is available, record null, which does not affect forwarding.
 - Input tokens use a mutually exclusive accounting basis:
 
   ```text
@@ -81,23 +81,18 @@ Request headers follow an explicit stripping policy that prioritizes compatibili
 
 ### 4.1 SSE terminal events
 
-- Only `response.completed` and `response.incomplete` are treated as terminal events;
-  `response.done` is added to compatibility only after a manual protocol PoC proves it actually exists.
-- All unknown SSE events are forwarded unchanged.
-- When a terminal event exceeds the internal bounded parse limit, it is still forwarded to the client in full;
-  that request's audit records `usage=null`, `accounting_quality=unavailable`, and
-  `metering_error=event_too_large`. The limit value is chosen after PoC observation
-  and is an implementation parameter, not a product promise.
-- Implementation note (parser reuse): the bounded SSE observer does not adopt `eventsource-stream` 0.2.3
-  (the crate used by the pinned Codex client). That crate has no per-event size cap, and observing through
-  a transparent tee would require either blocking, dropping, or unbounded buffering of the side channel,
-  plus separate cancellation coordination between the response pump and the observer. The pinned
-  orihsus bounded SSE parser (`src/gateway.rs`) is adapted instead, with a constant-size streaming
-  event-field scanner fed every byte of the event (including bytes beyond the retained cap while
-  discarding): an oversized discarded event's terminal kind is decided at its completed delimiter by the
-  last line-start `event:` field (SSE last-field-wins, exact whitespace semantics), while a partial event
-  truncated before the delimiter is never delivered. The constant-size field scanner is reused/adapted
-  from prior local code, with its whitespace handling corrected.
+- The observer frames the response bytes with `eventsource-stream` 0.2.3 — the same mature crate used by
+  the pinned Codex client — regardless of Content-Type, and selects a supported terminal event from the
+  event-data JSON (`response.completed` / `response.incomplete`); `response.done` is added to compatibility
+  only after a manual protocol PoC proves it actually exists.
+- All unknown SSE events are forwarded unchanged and never become a terminal.
+- A body that framed as SSE but ended without a supported terminal event never reached a completed
+  lifecycle and is recorded `upstream_interrupted` with null usage.
+- A body that never framed as SSE is read as one complete non-streaming JSON document; reaching clean EOF
+  keeps the completed lifecycle even when the metering parse fails (missing/malformed usage).
+- No per-event cap or oversized-event recovery is applied: the mirror is parsed at lifecycle finalization
+  after the caller already received the bytes, so observation cannot delay or alter forwarding. Memory is
+  not optimized before measurement.
 
 ## 5. Audit (canonical request audit)
 
@@ -126,6 +121,10 @@ Schema (canonical, allowlist-based):
 | `accounting_quality` | `complete \| partial \| inconsistent \| unavailable` |
 | `metering_error` | `null \| missing_usage \| malformed_usage \| event_too_large` |
 | `usage` | `null` or object `{input_total, uncached, cache_read, cache_write, output_total, reasoning, total}`, each number may be null |
+
+The `metering_error=event_too_large` value is retained for reading records written before the
+library-based observer (DESIGN.md §4.1) replaced the per-event-capped parser; the current observer
+never produces it.
 
 Scenario mapping:
 
@@ -170,7 +169,8 @@ Correlation uses only the `event_id` generated by the gateway itself.
 - nginx/systemd configuration belongs to deployment documentation and deployment acceptance, and does not enter the core proxy's behavior tests.
 - jemalloc is the default allocator for Linux release builds, with no parameters tuned.
 - The following are **correctness constraints** (in-spec): SSE streaming response protocol correctness, opaque request streaming,
-  bounded bypass parsing buffers, and bounded audit queues — these fulfill the promise that "parsing/audit must not drag the proxy down".
+  observation that never delays or alters forwarding (the mirror is parsed at lifecycle finalization, after the caller
+  already received the bytes), and bounded audit queues — these fulfill the promise that "parsing/audit must not drag the proxy down".
 - Deferred to future work: global body budget, admission queue, per-client/global concurrency control,
   systemd MemoryMax/stream slots tuning, and performance-benchmark metrics. Performance optimization is measurement-driven.
 - Fallback to direct connection: a purely operational action (switching the Codex provider back to direct connection); automatic failover is not implemented.
@@ -211,9 +211,8 @@ real captures must not be committed; only minimal, de-identified, synthetic SSE/
 The following issues do not block specification or test writing, but they do block confirmation of production usability:
 
 - [ ] Content-encoding distribution of real Codex requests.
-- [ ] Whether the response terminal object stably carries `model`.
+- [ ] Whether the `openai-model` response header reliably accompanies real Codex responses (header-primary model attribution depends on it).
 - [ ] Whether the `response.done` event actually exists (determines whether it is included for compatibility).
-- [ ] Typical size of real terminal SSE events, used to choose the bounded parse limit value.
 - [ ] Confirmation of the real response shape of the compact route.
 
 ## 12. Initial outcome issues

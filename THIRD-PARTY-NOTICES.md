@@ -1,19 +1,23 @@
 # Third-party notices
 
+## eventsource-stream (MIT OR Apache-2.0)
+
+The response-body usage observer frames the mirrored response bytes with
+[eventsource-stream](https://github.com/jpopesculian/eventsource-stream) 0.2.3 —
+the same SSE-framing crate pinned by the official Codex client
+([openai/codex](https://github.com/openai/codex) 0.149.0,
+`codex-rs/codex-api`, which drives `stream.eventsource()` on the response body
+regardless of Content-Type). It is used unmodified through Cargo and licensed
+under MIT OR Apache-2.0; the event-data JSON is then read with `serde_json`.
+The handwritten SSE delimiter/tail/field-scanner/event-name/cap machinery it
+replaces has been removed.
+
 ## ariga39/orihsus (MIT)
 
 This project selectively ports and adapts compatible building blocks from the
 independent Codex gateway [ariga39/orihsus](https://github.com/ariga39/orihsus)
 at the pinned revision `7285dd5c6a7ec5f1c0e521c6ee71f70e659d6220`:
 
-- `StreamUsageParser`, `SseUsageParser`, and `JsonUsageParser` are adapted
-  directly from `src/gateway.rs` (lines around 2261, 2294, and 2336
-  respectively). The combination that feeds both bounded observers over the
-  same response stream and selects the grounded terminal result is a local
-  composition on top of those adapted parser pieces, not an upstream feature:
-  orihsus selects a single parser by content type, whereas debitmetre observes
-  SSE and non-streaming JSON simultaneously because real Codex responses can be
-  SSE-framed under a JSON Content-Type.
 - The bounded single-writer JSONL audit writer is adapted from `src/audit.rs`
   (lines around 291, 504, and 527 respectively).
 - `DropNotifyStream` and its response-pump select pattern (client-cancel
@@ -21,8 +25,10 @@ at the pinned revision `7285dd5c6a7ec5f1c0e521c6ee71f70e659d6220`:
   (lines around 2413 and 1966–1995 respectively).
 
 orihsus's key-pool/retry/quota/product semantics are not imported; only the
-stream pump, SSE/JSON usage parsing, and audit writer building blocks are used,
-adapted to debitmetre's canonical allowlisted audit schema (DESIGN.md §5).
+response pump and audit writer building blocks are used, adapted to
+debitmetre's canonical allowlisted audit schema (DESIGN.md §5). The SSE/JSON
+usage observation no longer ports orihsus's parser: it uses `eventsource-stream`
+0.2.3 (see above) plus `serde_json`.
 
 The upstream source is distributed under the MIT and Apache-2.0 licenses. The
 full MIT notice follows:

@@ -35,8 +35,9 @@ pub const PRODUCTION_UPSTREAM_BASE: &str = "https://chatgpt.com/backend-api/code
 /// usage file; the returned router exposes the fixed route set. The injectable
 /// upstream base is a test seam ([`Gateway::for_tests`]); production uses
 /// [`Gateway::production`]. Each accepted request streams its upstream response
-/// to the caller unchanged while a bounded side-band parser extracts usage and
-/// produces one canonical JSONL record (DESIGN.md §5, §10 audit seam).
+/// to the caller unchanged while the observer mirrors the bytes and extracts
+/// usage at lifecycle finalization, producing one canonical JSONL record
+/// (DESIGN.md §5, §10 audit seam).
 #[derive(Clone)]
 pub struct Gateway {
     client: reqwest::Client,
@@ -264,14 +265,24 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
             let audit = Arc::clone(&gateway.audit);
             let status_u16 = status.as_u16();
             let is_success = status.is_success();
+            // The valid `openai-model` response header is the primary
+            // server-reported model, mirroring the pinned codex-cli 0.149.0
+            // `ServerModel` event; the terminal-body model is only the fallback.
+            let header_model = upstream
+                .headers()
+                .get("openai-model")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
             tokio::spawn(async move {
-                // The parser is independent of the upstream Content-Type: the
+                // The observer is independent of the upstream Content-Type: the
                 // Codex Responses client feeds the same byte stream to its own
-                // SSE parser, and real responses can be SSE-framed even under a
-                // JSON Content-Type (issue #20). A body that never frames as
-                // SSE is extracted as complete JSON from the same bounded
-                // buffer (see `usage::StreamUsageParser`).
-                let mut parser = StreamUsageParser::new();
+                // SSE parser (`eventsource-stream` 0.2.3), and real responses
+                // can be SSE-framed even under a JSON Content-Type (issue #20).
+                // The pump mirrors every forwarded byte and the observer parses
+                // the mirror once at lifecycle finalization; a body that never
+                // frames as SSE is extracted as complete JSON (see
+                // `usage::StreamUsageParser`).
+                let mut parser = StreamUsageParser::new(header_model);
                 let mut outcome = Outcome::Completed;
                 let mut stream = upstream.bytes_stream();
                 // The response body is wrapped in `DropNotifyStream`, so this
@@ -307,6 +318,7 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
                 if !completed {
                     outcome = Outcome::ClientCancelled;
                 }
+                parser.finalize().await;
                 record_audit(
                     &audit,
                     &machine_id,
@@ -347,8 +359,8 @@ async fn route_responses(gateway: Gateway, req: Request<Body>, endpoint_suffix: 
 
 /// Record the canonical audit line for an accepted request at its terminal
 /// state (DESIGN.md §5 scenario mapping). Non-2xx responses record
-/// `upstream_error` and never meter usage; for 2xx responses the side-band
-/// parser supplies model/usage/quality or an explicit metering error.
+/// `upstream_error` and never meter usage; for 2xx responses the observer
+/// supplies model/usage/quality or an explicit metering error.
 fn record_audit(
     audit: &usage::AuditWriter,
     machine_id: &str,
