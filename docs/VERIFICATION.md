@@ -32,7 +32,10 @@ aggregate evidence. It never applies an arbitrary RSS threshold and never change
 binary on a loopback port, points your existing authenticated `codex` CLI at it through a temporary model
 provider, gives it a tiny deterministic `add(a,b)` task in a disposable git repository, runs an independent
 Python test, and prints only sanitized pass/fail evidence (task test, canonical audit record shape,
-per-model summary grouping, lifecycle logs). Only after the explicit `DEBITMETRE_REAL_E2E=1` opt-in does it
+per-model summary grouping, lifecycle logs). It also explicitly proves, from sanitized method/route/status
+lifecycle-log evidence, that the Codex model-discovery `GET /v1/models` request was accepted and received a
+2xx upstream response, so a non-fatal local or upstream 404 cannot be silently hidden by the later task
+success (issue #29). Only after the explicit `DEBITMETRE_REAL_E2E=1` opt-in does it
 contact the real Codex upstream through your own authenticated codex login; it never inspects OAuth, never
 prints or persists the synthetic X-Meter key, and never retains generated artifacts (all temporary state is
 removed by a trap). It is strictly opt-in and never runs under `cargo test` or CI:

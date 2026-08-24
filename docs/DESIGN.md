@@ -15,21 +15,35 @@ not an actual bill or subscription-credit consumption.
 
 ## 2. Routing and protocol behavior
 
-Fixed external route set (closed route set):
+Authenticated fixed-origin provider forwarding under `/v1` (issue #29):
 
 | Route | Method | Behavior |
 |---|---|---|
-| `/v1/responses` | POST | Fixed mapping to the corresponding path under `chatgpt.com/backend-api/codex` |
-| `/v1/responses/compact` | POST | Same as above, for compact requests |
+| `/v1/*` | any | Auth-gated transparent forwarding to the corresponding path under `chatgpt.com/backend-api/codex`, preserving method/path/query |
+| `/v1/responses` | any | Forwarded; metered as `response` |
+| `/v1/responses/compact` | any | Forwarded; metered as `compaction` |
 | `/healthz` | GET | Minimal health check; contract below |
+
+The caller's original HTTP method, relative path below `/v1`, query, headers (per the policy in §2.1),
+and streaming body are forwarded unchanged. The upstream scheme/host/port/base prefix are never
+caller-controlled: the upstream URL is built only from the fixed compiled base plus the caller's relative
+path below `/v1`, so an incoming `Host`, absolute-form target, path, or query can never redirect the
+request to another origin (SSRF prevention). This covers Codex model discovery (`GET /v1/models`) and any
+future `/v1` provider path without a stale local allowlist; only paths outside `/v1` are a local 404.
 
 `/healthz` accepted contract: no authentication required; returns a minimal 200 once a valid configuration is loaded and the listener is ready.
 It does not probe OpenAI, does not leak any configuration content, and does not represent runtime audit writability or any runtime health state.
 
-- Unknown paths return 404; wrong methods on known paths return 405; neither is ever forwarded to the upstream.
+- Every forwarded request requires exactly one valid `X-Meter-Key` before any upstream connection is
+  attempted; a missing, duplicate, malformed, or unknown key returns a uniform local 401. Wrong methods on
+  `/v1/*` are forwarded like any other method; a path outside `/v1` returns 404. Neither is ever forwarded
+  to the upstream.
 - The production upstream is fixed in code and cannot be changed via configuration (SSRF prevention); following upstream redirects is forbidden.
 - Tests may inject a fake upstream at process/module construction time; no such option exists in production configuration.
 - Both SSE streaming and non-streaming JSON responses are transparently supported. Content-Type alone is not authoritative for Responses framing: a body labeled `application/json` can still be SSE-framed (the Codex client feeds the response bytes to its own SSE parser regardless of Content-Type). The observer mirrors the forwarded bytes and, at lifecycle finalization, frames the whole mirror as SSE with the same library the pinned Codex client uses (`eventsource-stream` 0.2.3); a supported terminal `response.completed` / `response.incomplete` event wins, otherwise the complete non-streaming JSON body wins (a body that never framed as SSE).
+- `/v1/responses` and `/v1/responses/compact` are metered into the canonical audit (§5). Other `/v1`
+  provider paths (for example model discovery) are forwarded and lifecycle-logged via `tracing` but produce
+  no canonical usage record and never invent usage.
 
 ### 2.1 Semantic transparency boundary
 
@@ -162,8 +176,9 @@ The exact command invocation is documented in [docs/OPERATIONS.md](OPERATIONS.md
 - Metering parse failures, malformed data, and audit failures must never change the already-received upstream
   status/header/body, and must never proactively cancel a request that could otherwise continue.
 - Runtime diagnostics: emit sanitized events to stderr. Request-lifecycle diagnostics may include the
-  allowlisted stable `machine_id`, request route/operation, `outcome`, and upstream `status`; other
-  diagnostics (startup, configuration, shutdown) may include necessary non-secret operational context.
+  allowlisted stable `machine_id`, request route/operation, HTTP `method`, `outcome`, and upstream
+  `status`; other diagnostics (startup, configuration, shutdown) may include necessary non-secret
+  operational context.
   The following are forbidden in all cases: meter keys/credentials, `Authorization`/OAuth material,
   request or response bodies, ChatGPT account or upstream request identifiers, raw headers, and client
   network metadata (`audit_write_failed` / `audit_dropped` are examples). The MVP has no metrics system,
@@ -198,7 +213,7 @@ The exact command invocation is documented in [docs/OPERATIONS.md](OPERATIONS.md
 
 **Included**
 
-1. Fixed-route transparent proxy (Responses/compact, SSE+JSON).
+1. Authenticated fixed-origin `/v1` provider forwarding (Responses/compact metered, SSE+JSON).
 2. Per-machine X-Meter-Key authentication with a server-side machine_id mapping.
 3. Responses/compact usage extraction with canonical best-effort JSONL audit.
 4. Minimal health endpoint.

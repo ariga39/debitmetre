@@ -67,15 +67,16 @@ same way: an invalid or unwritable path prevents startup.
 
 After a successful startup, a transient audit write failure is **fail-open**: the caller-visible upstream
 response stays unchanged and a sanitized `audit_write_failed` diagnostic is emitted to stderr. Request
-lifecycle diagnostics may include the allowlisted `machine_id`, route/operation, `outcome`, and upstream
-`status`; other diagnostics may include necessary non-secret operational context. None ever include
-credentials, bodies, raw headers, account or upstream request identifiers, or client network metadata. See
-DESIGN.md §6–§7 for the full contract.
+lifecycle diagnostics may include the allowlisted `machine_id`, route/operation, HTTP `method`, `outcome`,
+and upstream `status`; other diagnostics may include necessary non-secret operational context. None ever
+include credentials, bodies, raw headers, account or upstream request identifiers, or client network
+metadata. See DESIGN.md §6–§7 for the full contract.
 
 ## Logging and privacy
 
 Operational logs go to stderr. Request-lifecycle diagnostics may include the allowlisted stable
-`machine_id`, the request `operation` (route), the `outcome`, and the upstream `status`. Other diagnostics
+`machine_id`, the request `operation` (route), the HTTP `method`, the `outcome`, and the upstream `status`.
+Other diagnostics
 (startup, configuration, and shutdown) may include necessary non-secret operational context such as event
 names, the listen address, machine count, reason, and the config path. The following are **forbidden** from
 any log or diagnostic: meter keys/credentials, `Authorization`/OAuth material, request or response bodies,
@@ -88,9 +89,44 @@ addresses). The audit record itself is governed by the stricter allowlist in DES
 curl -fsS http://127.0.0.1:8787/healthz    # 200 once configured and listening
 ```
 
-Codex clients reach the gateway through the authenticated transparent proxy routes: `POST /v1/responses`
-and `POST /v1/responses/compact` with an `X-Meter-Key` header. The upstream is fixed in code and redirects
-are never followed. Unknown paths return 404 and wrong methods return 405; neither is forwarded.
+`GET /healthz` stays local and unauthenticated. Every other request is forwarded
+only after it presents exactly one valid `X-Meter-Key` (a missing, duplicate,
+malformed, or unknown key returns a uniform local 401 before any upstream
+connection). Provider traffic under `/v1` is forwarded transparently: the
+client's original method, relative path below `/v1`, query, headers, and
+streaming body go to the fixed upstream origin, which the client can never
+choose. This includes Codex model discovery (`GET /v1/models`) and any future
+`/v1` provider path; only paths outside `/v1` (for example `/nope`) are a local
+404. Redirects are never followed. `/v1/responses` and `/v1/responses/compact`
+are metered into the canonical audit; other provider paths are forwarded and
+lifecycle-logged without producing a canonical usage record.
+
+## Configure a Codex client
+
+Point a Codex client at the gateway as its model provider with a persistent
+`~/.codex/config.toml` entry:
+
+```toml
+[model_providers.debitmetre]
+name = "debitmetre"
+base_url = "https://gateway.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+http_headers = { "X-Meter-Key" = "REPLACE-WITH-A-REAL-METER-KEY" }
+```
+
+Replace the placeholder `X-Meter-Key` value with the actual meter key issued for
+this machine, then protect the file from other local users:
+
+```sh
+chmod 600 ~/.codex/config.toml
+```
+
+The gateway does not manage OAuth: `requires_openai_auth = true` lets Codex use
+its existing ChatGPT authentication for its own login flow, while the gateway
+authenticates only the `X-Meter-Key`. Environment-variable header injection may
+be used in testing, but the persistent `http_headers` entry above is the
+supported user setup.
 
 ## View accumulated usage
 

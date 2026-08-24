@@ -22,6 +22,34 @@ working directory. `--config` defaults to `/etc/debitmetre/config.toml`; use `de
 full usage text. Operational logs go to stderr (suitable for a terminal, journald, or an operator-selected
 supervisor) and never print meter keys or request/response bodies.
 
+## Configure a Codex client
+
+Point a Codex client at the gateway as its model provider by adding a persistent
+`model_providers.debitmetre` block to the user's `~/.codex/config.toml`:
+
+```toml
+[model_providers.debitmetre]
+name = "debitmetre"
+base_url = "https://gateway.example.com/v1"
+wire_api = "responses"
+requires_openai_auth = true
+http_headers = { "X-Meter-Key" = "REPLACE-WITH-A-REAL-METER-KEY" }
+```
+
+- Replace the placeholder `X-Meter-Key` value with the actual meter key your
+  gateway operator issued for this machine; it is not a real key.
+- Protect the config file from other local users:
+
+  ```sh
+  chmod 600 ~/.codex/config.toml
+  ```
+
+The gateway authenticates every forwarded request with `X-Meter-Key` before any
+upstream connection, forwards the client's method/path/query to the fixed
+upstream origin, and never lets the client choose the upstream. All provider
+traffic under `/v1` is forwarded (including Codex model discovery on
+`GET /v1/models`); Responses and compact requests are metered into the audit.
+
 ## View accumulated usage
 
 ```sh
