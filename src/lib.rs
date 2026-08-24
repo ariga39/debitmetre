@@ -197,7 +197,12 @@ async fn route_v1(gateway: Gateway, req: Request<Body>) -> Response {
         tracing::info!("request rejected: missing or invalid meter key");
         return unauthorized();
     };
-    tracing::info!(machine_id = machine_id.as_str(), "request accepted");
+    let method = req.method().clone();
+    tracing::info!(
+        method = method.as_str(),
+        machine_id = machine_id.as_str(),
+        "request accepted"
+    );
 
     // The route label used for lifecycle logs preserves the historical
     // `responses` / `responses/compact` values for the metered paths and names
@@ -232,7 +237,7 @@ async fn route_v1(gateway: Gateway, req: Request<Body>) -> Response {
 
     let connection_nominated = connection_nominated_headers(req.headers());
 
-    let mut builder = gateway.client.request(req.method().clone(), upstream_url);
+    let mut builder = gateway.client.request(method.clone(), upstream_url);
     for (name, value) in req.headers().iter() {
         if request_header_is_stripped(name, &connection_nominated) {
             continue;
@@ -254,6 +259,7 @@ async fn route_v1(gateway: Gateway, req: Request<Body>) -> Response {
                 tracing::info!(
                     event = "upstream_response",
                     route = route_label,
+                    method = method.as_str(),
                     machine_id = machine_id.as_str(),
                     status = status.as_u16(),
                     "upstream response"
@@ -262,6 +268,7 @@ async fn route_v1(gateway: Gateway, req: Request<Body>) -> Response {
                 tracing::warn!(
                     event = "upstream_http_error",
                     route = route_label,
+                    method = method.as_str(),
                     machine_id = machine_id.as_str(),
                     status = status.as_u16(),
                     "upstream error"
@@ -383,6 +390,7 @@ async fn route_v1(gateway: Gateway, req: Request<Body>) -> Response {
             tracing::error!(
                 event = "upstream_transport_error",
                 route = route_label,
+                method = method.as_str(),
                 machine_id = machine_id.as_str(),
                 "upstream transport error"
             );

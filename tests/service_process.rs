@@ -383,9 +383,10 @@ async fn normal_and_non_2xx_upstream_responses_emit_distinct_structured_events()
     );
     assert!(
         info_line.contains("route=\"responses\"")
+            && info_line.contains("method=\"POST\"")
             && info_line.contains("machine_id=\"machine-a\"")
             && info_line.contains("status=201"),
-        "normal event carries route/machine/status context, got: {info_line}"
+        "normal event carries route/method/machine/status context, got: {info_line}"
     );
     assert!(
         error_line.contains("event=\"upstream_http_error\""),
@@ -393,9 +394,10 @@ async fn normal_and_non_2xx_upstream_responses_emit_distinct_structured_events()
     );
     assert!(
         error_line.contains("route=\"responses/compact\"")
+            && error_line.contains("method=\"POST\"")
             && error_line.contains("machine_id=\"machine-a\"")
             && error_line.contains("status=429"),
-        "upstream HTTP failure event carries route/machine/status context, got: {error_line}"
+        "upstream HTTP failure event carries route/method/machine/status context, got: {error_line}"
     );
     assert!(
         !logs.contains(TEST_METER_KEY),
@@ -412,6 +414,66 @@ async fn normal_and_non_2xx_upstream_responses_emit_distinct_structured_events()
     assert!(
         !logs.contains("opaque-upstream-error-body"),
         "logs must never print upstream error payloads"
+    );
+}
+
+/// Deterministic seam for the real-Codex E2E model-discovery check: a
+/// `GET /v1/models?client_version=...` request is accepted and receives an
+/// upstream response, and the gateway lifecycle log carries the sanitized
+/// method/route/status evidence (`method="GET"`, `route="models"`, 2xx) that
+/// the E2E relies on to prove model discovery is not silently 404ed.
+#[tokio::test]
+async fn model_discovery_get_v1_models_is_lifecycle_logged_with_method_route_and_2xx_status() {
+    let app = Router::new().fallback(fake_upstream_handler);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake upstream");
+    let addr = listener.local_addr().expect("fake upstream address");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("fake upstream runs");
+    });
+    let upstream = format!("http://{addr}");
+
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let config_path = write_config(&dir);
+    let gateway = GatewayProc::spawn(&config_path, Some(&upstream));
+
+    let port = gateway.bound_port();
+    wait_ready(port).await;
+
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+
+    let response = client
+        .get(format!("{base}/v1/models?client_version=0.149.1"))
+        .header("x-meter-key", TEST_METER_KEY)
+        .send()
+        .await
+        .expect("caller reaches the running gateway");
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "model discovery is accepted and forwarded to the fixed upstream"
+    );
+
+    let logs = gateway.wait_for_logs(&["upstream response"]);
+    let line = logs
+        .lines()
+        .find(|line| line.contains("upstream response"))
+        .expect("the model-discovery lifecycle event is logged");
+    assert!(
+        line.contains("event=\"upstream_response\"")
+            && line.contains("route=\"models\"")
+            && line.contains("method=\"GET\"")
+            && line.contains("machine_id=\"machine-a\"")
+            && line.contains("status=201"),
+        "model discovery lifecycle event carries method/route/status evidence, got: {line}"
+    );
+    assert!(
+        !logs.contains(TEST_METER_KEY),
+        "logs must never print the meter key"
     );
 }
 

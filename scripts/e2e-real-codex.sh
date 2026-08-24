@@ -7,7 +7,11 @@
 # temporary model provider, gives it a tiny deterministic add(a,b) task in a
 # disposable git repository, runs an independent Python test, and reports only
 # sanitized pass/fail evidence for task success, canonical usage, model
-# attribution, per-model summary, and diagnostic logs.
+# attribution, per-model summary, and diagnostic logs. It also explicitly
+# proves (from sanitized method/route/status lifecycle-log evidence) that the
+# Codex model-discovery `GET /v1/models` request was accepted and received a
+# 2xx upstream response, so a non-fatal local or upstream 404 cannot be silently
+# hidden by the later task success (issue #29).
 #
 # Hard opt-in: set DEBITMETRE_REAL_E2E=1. Without it this script exits 2 and
 # does nothing; it is never invoked by cargo tests or CI. The synthetic X-Meter
@@ -386,6 +390,42 @@ if grep -qF "$MARKER" "$LOG"; then
     die logs "gateway log contains the task body marker"
 fi
 
+# --- model-discovery lifecycle evidence (sanitized method/route/status) -----
+# For a custom model provider the Codex CLI always performs
+# `GET /v1/models?client_version=...` on startup. It is non-fatal, so a local
+# or upstream 404 would otherwise be silently hidden by the later task success.
+# Require the gateway to have accepted that request and received a 2xx upstream
+# response, proven only by method/route/status lifecycle-log evidence (never
+# credentials, headers, bodies, or model names).
+if ! python3 - "$LOG" <<'PY'
+import re
+import sys
+
+log_path = sys.argv[1]
+with open(log_path, encoding="utf-8") as f:
+    for line in f:
+        if "upstream response" not in line:
+            continue
+        if 'route="models"' not in line or 'method="GET"' not in line:
+            continue
+        m = re.search(r"status=(\d+)", line)
+        if m is None:
+            continue
+        if 200 <= int(m.group(1)) <= 299:
+            print("model_discovery=accepted_2xx")
+            sys.exit(0)
+print(
+    "no accepted GET /v1/models lifecycle event with a 2xx upstream status in the gateway log",
+    file=sys.stderr,
+)
+sys.exit(1)
+PY
+then
+    :
+else
+    die models "model-discovery request was not accepted with a 2xx upstream response (a local or upstream 404 may be silently hidden)"
+fi
+
 # --- the runtime meter key must never appear in any generated artifact ------
 # Scanned before cleanup (the trap removes everything): a leak is a hard
 # failure, not something to preserve or emit.
@@ -401,7 +441,9 @@ RECORDS="$(jq --slurp 'length' "$WORKDIR/usage.jsonl")"
 echo "debitmetre e2e: PASS task: independent add(a,b) Python test passed"
 echo "debitmetre e2e: PASS audit: canonical schema_version=1 request record with required lifecycle fields, exactly seven usage counters, non-null model, and integral nonnegative nonzero usage"
 echo "debitmetre e2e: PASS summary: per-model summary groups match the accepted canonical audit records with nonzero totals"
+echo "debitmetre e2e: PASS models: GET /v1/models accepted with a 2xx upstream response (sanitized method/route/status evidence)"
 echo "debitmetre e2e: PASS logs: accepted/upstream lifecycle events; no raw meter key or task body marker"
 echo "debitmetre e2e: PASS artifacts: raw meter key absent from all generated artifacts"
 echo "debitmetre e2e: evidence: codex_exit=$CODEX_EXIT records=$RECORDS port=$PORT"
 echo "debitmetre e2e: evidence: summary_rows=$SUMMARY_ROWS has_nonzero=1"
+echo "debitmetre e2e: evidence: model_discovery=accepted_2xx"
