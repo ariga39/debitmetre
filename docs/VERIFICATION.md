@@ -30,18 +30,36 @@ aggregate evidence. It never applies an arbitrary RSS threshold and never change
 
 `scripts/e2e-real-codex.sh` is an operator opt-in system acceptance: it starts the current `debitmetre`
 binary on a loopback port, points your existing authenticated `codex` CLI at it through a temporary model
-provider, gives it a tiny deterministic `add(a,b)` task in a disposable git repository, runs an independent
-Python test, and prints only sanitized pass/fail evidence (task test, canonical audit record shape,
-per-model summary grouping, lifecycle logs). It also explicitly proves, from sanitized method/route/status
-lifecycle-log evidence, that the Codex model-discovery `GET /v1/models` request was accepted and received a
-2xx upstream response, so a non-fatal local or upstream 404 cannot be silently hidden by the later task
-success (issue #29). Only after the explicit `DEBITMETRE_REAL_E2E=1` opt-in does it
-contact the real Codex upstream through your own authenticated codex login; it never inspects OAuth, never
-prints or persists the synthetic X-Meter key, and never retains generated artifacts (all temporary state is
-removed by a trap). It is strictly opt-in and never runs under `cargo test` or CI:
+provider, and runs the explicit installed `gpt-5.6-luna` model (issue #31) on a deterministic multi-file
+Python diagnostic task in a disposable git repository. The generated task has an interacting
+loader/aggregate/CLI call chain with two seeded behavioral defects; the independent acceptance command
+must **fail before** Codex runs (honest red evidence) and **pass after** Codex repairs the source, while
+the task README, data fixture, and acceptance test stay byte-for-byte unchanged (success must come from
+real source changes only). It prints only sanitized pass/fail evidence (task red/green, canonical audit
+record shape, per-model summary grouping, lifecycle logs, protected-file provenance). It also explicitly
+proves, from sanitized method/route/status lifecycle-log evidence, that the Codex model-discovery
+`GET /v1/models` request was accepted and received a 2xx upstream response, so a non-fatal local or
+upstream 404 cannot be silently hidden by the later task success (issue #29). Only after the explicit
+`DEBITMETRE_REAL_E2E=1` opt-in does it contact the real Codex upstream through your own authenticated
+codex login; it never inspects OAuth, never prints or persists the synthetic X-Meter key, and never
+retains generated artifacts (all temporary state is removed by a trap). It is strictly opt-in and never
+runs under `cargo test` or CI:
 
 ```sh
 DEBITMETRE_REAL_E2E=1 scripts/e2e-real-codex.sh
+```
+
+## Diagnostic-task local seam check (no upstream)
+
+`scripts/verify-diagnostic-task.sh` is the testable local seam behind the E2E task: it generates the same
+deterministic task repository, proves the acceptance command fails on the seeded defects (red), verifies
+the protected contract files are unchanged, applies a minimal reference repair to the source modules,
+proves the same acceptance command then passes (green), and verifies the protected files are still
+unchanged while the source changed. It never starts the gateway and never calls Codex or any upstream, so
+it runs anywhere with `bash`, `python3`, and `sha256sum`:
+
+```sh
+scripts/verify-diagnostic-task.sh
 ```
 
 ## Prerequisites
@@ -49,10 +67,13 @@ DEBITMETRE_REAL_E2E=1 scripts/e2e-real-codex.sh
 - Mock load smoke: `cargo`, `oha` (via `OHA_BIN`, `--oha`, or `PATH`), and the tooling needed to build the
   test-feature binary.
 - Real-Codex self-test: `cargo`, `codex`, `python3`, `jq`, `curl`, `git`, `sha256sum`, `timeout`, `mktemp`,
-  `head`, `base64`, `tr`, `cut`, `cat`, `tail`, `sleep`, `mkdir`, `rm`, `grep`. Without
+  `head`, `base64`, `tr`, `cut`, `cat`, `tail`, `sleep`, `mkdir`, `rm`, `grep`, plus the repository's own
+  `scripts/gen-diagnostic-task.sh` and `scripts/check-diagnostic-task.sh` task generators. Without
   `DEBITMETRE_REAL_E2E=1` the script exits non-zero and does nothing. The script header lists the
   configurable loopback port and step timeout; invalid values (including 0, negatives, fractions, and
   option-like strings) fail before any traffic, and the port must be a free integer in `1..65535`.
+- Diagnostic-task local seam check: `bash`, `python3`, and `sha256sum`; it never needs `codex`, the
+  gateway, or an upstream.
 
 ## Process-level test
 
