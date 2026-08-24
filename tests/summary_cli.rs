@@ -128,6 +128,7 @@ machine-a     model-m1               2          300          210           50   
 machine-a     model-m2               1           40            -           10           10           20            -           60
 machine-b     model-m1               1           10            5            3            2            6            2           16
 - = not recorded in any record; totals sum only recorded values
+coverage: accepted=5 metered=4 unmetered=1 (80.0%)
 "#;
 
 /// Complete expected stdout when the final record (machine-b / model-m2) is
@@ -139,6 +140,7 @@ machine-a     model-m2               1           40            -           10   
 machine-b     model-m1               1           10            5            3            2            6            2           16
 machine-b     model-m2               1           22           11            5            6           12            4           34
 - = not recorded in any record; totals sum only recorded values
+coverage: accepted=6 metered=5 unmetered=1 (83.3%)
 "#;
 
 fn run_summary(config_path: &Path) -> (ExitStatus, String, String) {
@@ -155,6 +157,30 @@ fn run_summary(config_path: &Path) -> (ExitStatus, String, String) {
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+/// The base fixture (see [`base_fixture`]) contains 5 valid canonical
+/// `kind=request` lifecycles: 4 carry a non-null `usage` object (evt-a1, evt-a2,
+/// evt-a3, evt-b1, including the partial evt-a3) and 1 carries `usage: null`
+/// (evt-null-usage). So accepted=5, metered=4, unmetered=1, coverage=80.0%.
+/// These counts are independently known from the fixture itself, not derived
+/// from the renderer. `EXPECTED_BASE_STDOUT` includes the coverage line.
+#[test]
+fn summary_prints_overall_metering_coverage() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let usage_file = dir.path().join("usage.jsonl");
+    std::fs::write(&usage_file, base_fixture()).expect("write synthetic usage file");
+    let config_path = write_config(&dir, &usage_file);
+
+    let (status, stdout, stderr) = run_summary(&config_path);
+    assert!(status.success(), "summary exits zero, stderr: {stderr}");
+    // The per-machine/per-model token rows are unchanged; the coverage line is
+    // appended after them with the independently known counts and percentage.
+    assert_eq!(stdout, EXPECTED_BASE_STDOUT);
+    assert!(
+        !stderr.contains("unfinished trailing line"),
+        "no coverage warnings expected, got: {stderr}"
+    );
 }
 
 #[test]

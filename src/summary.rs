@@ -44,20 +44,52 @@ struct ReadWarnings {
     unparseable: u64,
 }
 
+/// Overall metering coverage over accepted request lifecycles (issue #23).
+/// Every valid canonical `kind=request` record is one accepted lifecycle
+/// (including records whose `usage` is null); a lifecycle is metered exactly
+/// when its record carries a non-null `usage` object (partial usage still
+/// counts). The percentage is `metered / accepted`, defined and printed as
+/// `(percentage)%`. Malformed complete lines and unfinished trailing lines are
+/// warned about and never enter any of these counts.
+#[derive(Debug, Clone, Copy, Default)]
+struct Coverage {
+    accepted: u64,
+    metered: u64,
+}
+
+impl Coverage {
+    fn unmetered(self) -> u64 {
+        self.accepted - self.metered
+    }
+
+    /// Coverage as a percentage of accepted lifecycles, or `None` when there is
+    /// no accepted lifecycle to divide by (the division is never performed on 0).
+    fn percentage(self) -> Option<f64> {
+        if self.accepted == 0 {
+            None
+        } else {
+            Some(self.metered as f64 * 100.0 / self.accepted as f64)
+        }
+    }
+}
+
 /// Read the usage file and print the grouped summary to `out`. Warnings (a
 /// skipped unfinished trailing line, unparseable records) go to stderr.
 pub fn print_summary(path: &Path, out: &mut dyn Write) -> Result<(), String> {
-    let (groups, warnings) = read_usage_file(path)?;
-    render(out, &groups).map_err(|err| format!("cannot write summary: {err}"))?;
+    let (groups, coverage, warnings) = read_usage_file(path)?;
+    render(out, &groups, &coverage).map_err(|err| format!("cannot write summary: {err}"))?;
     print_warnings(&warnings);
     Ok(())
 }
 
-fn read_usage_file(path: &Path) -> Result<(BTreeMap<GroupKey, GroupTotals>, ReadWarnings), String> {
+fn read_usage_file(
+    path: &Path,
+) -> Result<(BTreeMap<GroupKey, GroupTotals>, Coverage, ReadWarnings), String> {
     let file = std::fs::File::open(path)
         .map_err(|err| format!("cannot read usage file {}: {err}", path.display()))?;
     let mut reader = io::BufReader::new(file);
     let mut groups: BTreeMap<GroupKey, GroupTotals> = BTreeMap::new();
+    let mut coverage = Coverage::default();
     let mut warnings = ReadWarnings::default();
     let mut line: Vec<u8> = Vec::new();
     loop {
@@ -78,6 +110,12 @@ fn read_usage_file(path: &Path) -> Result<(BTreeMap<GroupKey, GroupTotals>, Read
         }
         match serde_json::from_slice::<AuditRecord>(record) {
             Ok(record) => {
+                // Every valid canonical record is one accepted lifecycle, with
+                // or without usage; a non-null usage object is metered.
+                coverage.accepted += 1;
+                if record.usage.is_some() {
+                    coverage.metered += 1;
+                }
                 if let Some(usage) = record.usage {
                     let key = (record.machine_id, record.model);
                     accumulate_usage(groups.entry(key).or_default(), &usage);
@@ -99,7 +137,7 @@ fn read_usage_file(path: &Path) -> Result<(BTreeMap<GroupKey, GroupTotals>, Read
             break;
         }
     }
-    Ok((groups, warnings))
+    Ok((groups, coverage, warnings))
 }
 
 fn accumulate_usage(totals: &mut GroupTotals, usage: &Usage) {
@@ -124,7 +162,11 @@ const MODEL_W: usize = 16;
 const RECORDS_W: usize = 8;
 const COUNTER_W: usize = 12;
 
-fn render(out: &mut dyn Write, groups: &BTreeMap<GroupKey, GroupTotals>) -> io::Result<()> {
+fn render(
+    out: &mut dyn Write,
+    groups: &BTreeMap<GroupKey, GroupTotals>,
+    coverage: &Coverage,
+) -> io::Result<()> {
     writeln!(
         out,
         "{:<MACHINE_W$}{:<MODEL_W$}{:>RECORDS_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$}",
@@ -157,6 +199,18 @@ fn render(out: &mut dyn Write, groups: &BTreeMap<GroupKey, GroupTotals>) -> io::
     writeln!(
         out,
         "- = not recorded in any record; totals sum only recorded values"
+    )?;
+    let percentage = match coverage.percentage() {
+        Some(pct) => format!("({pct:.1}%)"),
+        None => "(no accepted lifecycles)".to_string(),
+    };
+    writeln!(
+        out,
+        "coverage: accepted={} metered={} unmetered={} {}",
+        coverage.accepted,
+        coverage.metered,
+        coverage.unmetered(),
+        percentage
     )
 }
 

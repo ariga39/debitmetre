@@ -53,7 +53,11 @@ debitmetre summary --config /etc/debitmetre/config.toml
 The output is a fixed-width table (machine, model, record count, then input,
 uncached, cache-read, cache-write, output, reasoning, and total tokens). Totals
 sum only the values actually recorded; a counter that was never recorded shows
-`-` and is never invented as 0, and no prices are computed. An unfinished
+`-` and is never invented as 0, and no prices are computed. A final coverage
+line reports the overall metering coverage of accepted request lifecycles:
+every valid canonical record contributes one accepted lifecycle, and one whose
+record carries a non-null usage object counts as metered (partial usage still
+counts). An unfinished
 trailing line left by a process crash is ignored with a warning while earlier
 complete records are still summarized. Warnings go to stderr.
 
