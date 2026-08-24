@@ -72,8 +72,9 @@ scripts/verify-diagnostic-task.sh
   `DEBITMETRE_REAL_E2E=1` the script exits non-zero and does nothing. The script header lists the
   configurable loopback port and step timeout; invalid values (including 0, negatives, fractions, and
   option-like strings) fail before any traffic, and the port must be a free integer in `1..65535`.
-- Diagnostic-task local seam check: `bash`, `python3`, and `sha256sum`; it never needs `codex`, the
-  gateway, or an upstream.
+- Diagnostic-task local seam check: `bash`, `python3`, `git`, `mktemp`, `sha256sum`, plus the repository's
+  own `scripts/gen-diagnostic-task.sh` and `scripts/check-diagnostic-task.sh` generators; it never needs
+  `codex`, the gateway, or an upstream.
 
 ## Process-level test
 

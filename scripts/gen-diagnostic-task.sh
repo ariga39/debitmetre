@@ -37,21 +37,28 @@ cat > "$DEST/README.md" <<'EOF'
 # order report task
 
 This tiny program loads line-based orders and prints an aggregated checkout
-report. Repair the two seeded defects so that the independent acceptance check
-passes.
+report. The independent success check below currently fails.
 
-Independent success check (do not modify `test_report.py`, `data/orders.txt`,
-or this README; repair only the source modules under `src/`):
+Inspect the project, repair it, and make the check pass. Do not modify
+`test_report.py`, the files under `data/`, or this README; repair only the
+source modules under `src/`.
+
+Independent success check:
 
     python3 test_report.py
 
-The expected report line is printed by the acceptance check.
+The expected report lines are printed by the acceptance check.
 EOF
 
 cat > "$DEST/data/orders.txt" <<'EOF'
 A-100:2:1250
 B-200:1:800
 C-300:4:300
+EOF
+
+cat > "$DEST/data/orders2.txt" <<'EOF'
+D-400:3:100
+E-500:2:50
 EOF
 
 cat > "$DEST/src/loader.py" <<'PY'
@@ -108,20 +115,24 @@ cat > "$DEST/test_report.py" <<'PY'
 import subprocess
 import sys
 
-EXPECTED = "subtotal=4500 tax=360 total=4860"
+CASES = [
+    ("data/orders.txt", "subtotal=4500 tax=360 total=4860"),
+    ("data/orders2.txt", "subtotal=400 tax=32 total=432"),
+]
 
-out = subprocess.run(
-    [sys.executable, "src/main.py", "data/orders.txt"],
-    capture_output=True,
-    text=True,
-)
-if out.returncode != 0:
-    print("CLI failed:", out.stderr, file=sys.stderr)
-    sys.exit(1)
-report = out.stdout.strip().splitlines()[-1]
-if report != EXPECTED:
-    print("got: %r\nexpected: %r" % (report, EXPECTED), file=sys.stderr)
-    sys.exit(1)
+for rel_path, expected in CASES:
+    out = subprocess.run(
+        [sys.executable, "src/main.py", rel_path],
+        capture_output=True,
+        text=True,
+    )
+    if out.returncode != 0:
+        print("CLI failed:", out.stderr, file=sys.stderr)
+        sys.exit(1)
+    report = out.stdout.strip().splitlines()[-1]
+    if report != expected:
+        print("got: %r\nexpected: %r" % (report, expected), file=sys.stderr)
+        sys.exit(1)
 print("all order report tests passed")
 PY
 

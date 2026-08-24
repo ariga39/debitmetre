@@ -25,7 +25,7 @@ trap cleanup EXIT
 
 # --- red: the generated acceptance command fails on the seeded defects -------
 "$SCRIPT_DIR/gen-diagnostic-task.sh" "$WORKDIR/task" >/dev/null
-PROTECTED=(README.md data/orders.txt test_report.py)
+PROTECTED=(README.md data/orders.txt data/orders2.txt test_report.py)
 BEFORE=()
 for f in "${PROTECTED[@]}"; do
     BEFORE+=("$(sha256sum "$WORKDIR/task/$f" | cut -d' ' -f1)")
