@@ -64,6 +64,10 @@ it runs anywhere with `bash`, `python3`, and `sha256sum`:
 scripts/verify-diagnostic-task.sh
 ```
 
+This seam, together with formatting, Clippy, the full feature test suite, and the release build, runs
+automatically on every pull request and push to `main` in CI (`.github/workflows/ci.yml`). The real-Codex
+E2E and mock load smoke are never run in hosted CI.
+
 ## Prerequisites
 
 - Mock load smoke: `cargo`, `oha` (via `OHA_BIN`, `--oha`, or `PATH`), and the tooling needed to build the
