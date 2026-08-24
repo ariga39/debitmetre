@@ -210,7 +210,7 @@ fi
 echo "debitmetre e2e: red evidence: independent acceptance failed before Codex ran"
 
 # --- snapshot protected-file and source digests to prove repair provenance --
-PROTECTED_DIGEST="$( (cd "$WORKDIR/task-repo" && sha256sum README.md data/orders.txt test_report.py) )"
+PROTECTED_DIGEST="$( (cd "$WORKDIR/task-repo" && sha256sum README.md data/orders.txt data/orders2.txt test_report.py) )"
 SRC_DIGEST_BEFORE="$( (cd "$WORKDIR/task-repo" && sha256sum src/loader.py src/aggregate.py src/main.py) )"
 
 # --- run the authenticated codex CLI against the local gateway -------------
@@ -218,7 +218,7 @@ SRC_DIGEST_BEFORE="$( (cd "$WORKDIR/task-repo" && sha256sum src/loader.py src/ag
 # bodies never reach the gateway's diagnostic logs. The installed model is
 # chosen explicitly (issue #31).
 MARKER="DEBITMETRE-E2E-TASK-BODY-MARKER"
-PROMPT="$MARKER Repair the two seeded defects in src/loader.py and src/aggregate.py so that the order report is correct and the independent check 'python3 test_report.py' passes. Do not modify README.md, data/orders.txt, or test_report.py; fix only the source modules under src/."
+PROMPT="$MARKER Inspect the failing order-report project, run 'python3 test_report.py' to see it fail, then repair it so that the check passes. Do not modify README.md, the files under data/, or test_report.py; fix only the source modules under src/."
 CODEX_EXIT=0
 if timeout "$TIMEOUT" codex exec -m gpt-5.6-luna -C "$WORKDIR/task-repo" \
     -c 'model_providers.debitmetre.name="debitmetre"' \
