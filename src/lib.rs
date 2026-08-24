@@ -106,6 +106,12 @@ fn unauthorized() -> Response {
     (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
 }
 
+/// A caller-controlled request target that resolves outside the fixed upstream
+/// base (or is not a valid URL) is rejected locally and never forwarded.
+fn bad_request() -> Response {
+    (StatusCode::BAD_REQUEST, "bad request").into_response()
+}
+
 /// Shared hop-by-hop predicate: a header is per-connection when it is nominated
 /// by `Connection` or is a standard hop-by-hop name (including the de-facto
 /// `Proxy-Connection`). Used by both request and response policies.
@@ -221,23 +227,57 @@ async fn route_v1(gateway: Gateway, req: Request<Body>) -> Response {
     let meter = operation.is_some();
 
     // Build the upstream URL from the fixed base plus the caller's relative
-    // path below `/v1`. Only the path/query are taken from the request; the
-    // origin always stays the compiled upstream base.
+    // path below `/v1`, preserving the caller's raw (including percent-encoded
+    // non-dot) path bytes for transparent forwarding. The complete candidate is
+    // parsed and normalized by the URL library (which resolves ordinary and
+    // percent-encoded dot segments); before sending, the normalized path must
+    // still lie under the normalized fixed upstream base path and the origin
+    // must still be the fixed origin. A caller-controlled parent segment that
+    // resolves above the fixed base prefix is rejected locally and never
+    // reaches the upstream (SSRF/path-escape prevention).
     let base_path = gateway.upstream_base.path().trim_end_matches('/');
-    let mut upstream_url = gateway.upstream_base.clone();
-    let upstream_path = if suffix.is_empty() {
+    let candidate_path = if suffix.is_empty() {
         base_path.to_string()
     } else {
         format!("{base_path}{suffix}")
     };
-    upstream_url.set_path(&upstream_path);
+    let query_part = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let origin = {
+        let mut base = gateway.upstream_base.clone();
+        base.set_path("");
+        base.set_query(None);
+        base.set_fragment(None);
+        base.to_string().trim_end_matches('/').to_string()
+    };
+    let mut parsed = match reqwest::Url::parse(&format!("{origin}{candidate_path}{query_part}")) {
+        Ok(url) => url,
+        Err(_) => {
+            tracing::warn!("request rejected: invalid upstream URL");
+            return bad_request();
+        }
+    };
+    let origin_fixed = parsed.scheme() == gateway.upstream_base.scheme()
+        && parsed.host_str() == gateway.upstream_base.host_str();
+    let normalized_path = parsed.path();
+    let inside_base = base_path.is_empty()
+        || normalized_path == base_path
+        || (normalized_path.starts_with(base_path)
+            && normalized_path.as_bytes().get(base_path.len()) == Some(&b'/'));
+    if !origin_fixed || !inside_base {
+        tracing::warn!("request rejected: path escapes the fixed upstream base");
+        return bad_request();
+    }
     if let Some(query) = req.uri().query() {
-        upstream_url.set_query(Some(query));
+        parsed.set_query(Some(query));
     }
 
     let connection_nominated = connection_nominated_headers(req.headers());
 
-    let mut builder = gateway.client.request(method.clone(), upstream_url);
+    let mut builder = gateway.client.request(method.clone(), parsed);
     for (name, value) in req.headers().iter() {
         if request_header_is_stripped(name, &connection_nominated) {
             continue;
