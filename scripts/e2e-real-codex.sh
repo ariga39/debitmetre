@@ -397,7 +397,7 @@ fi
 # Require the gateway to have accepted that request and received a 2xx upstream
 # response, proven only by method/route/status lifecycle-log evidence (never
 # credentials, headers, bodies, or model names).
-if ! python3 - "$LOG" <<'PY'
+if python3 - "$LOG" <<'PY'
 import re
 import sys
 
