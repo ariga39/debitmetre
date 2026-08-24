@@ -231,10 +231,11 @@ async fn route_v1(gateway: Gateway, req: Request<Body>) -> Response {
     // non-dot) path bytes for transparent forwarding. The complete candidate is
     // parsed and normalized by the URL library (which resolves ordinary and
     // percent-encoded dot segments); before sending, the normalized path must
-    // still lie under the normalized fixed upstream base path and the origin
-    // must still be the fixed origin. A caller-controlled parent segment that
-    // resolves above the fixed base prefix is rejected locally and never
-    // reaches the upstream (SSRF/path-escape prevention).
+    // be byte-for-byte the raw candidate path and the origin must still be the
+    // fixed origin. Any caller-controlled dot segment — whether it would escape
+    // the fixed base prefix or merely rewrite an in-base path — makes the parsed
+    // path differ from the candidate and is rejected locally, never reaching the
+    // upstream (SSRF/path-escape prevention and transparent forwarding).
     let base_path = gateway.upstream_base.path().trim_end_matches('/');
     let candidate_path = if suffix.is_empty() {
         base_path.to_string()
@@ -262,13 +263,14 @@ async fn route_v1(gateway: Gateway, req: Request<Body>) -> Response {
     };
     let origin_fixed = parsed.scheme() == gateway.upstream_base.scheme()
         && parsed.host_str() == gateway.upstream_base.host_str();
+    // Transparent path forwarding requires the normalized parsed path to be
+    // byte-for-byte the raw candidate path. The URL library resolves ordinary
+    // and percent-encoded dot segments during parsing, so any such segment
+    // (whether it would escape the base or only rewrite an in-base path) makes
+    // the parsed path differ from the candidate and is rejected locally.
     let normalized_path = parsed.path();
-    let inside_base = base_path.is_empty()
-        || normalized_path == base_path
-        || (normalized_path.starts_with(base_path)
-            && normalized_path.as_bytes().get(base_path.len()) == Some(&b'/'));
-    if !origin_fixed || !inside_base {
-        tracing::warn!("request rejected: path escapes the fixed upstream base");
+    if !origin_fixed || normalized_path != candidate_path {
+        tracing::warn!("request rejected: path is not preserved under the fixed upstream base");
         return bad_request();
     }
     if let Some(query) = req.uri().query() {

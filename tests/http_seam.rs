@@ -2696,43 +2696,58 @@ async fn parent_path_segment_cannot_cause_request_outside_the_fixed_upstream_bas
         "a normal /v1 path still forwards to the fixed base prefix"
     );
 
-    // A percent-encoded parent segment reaches the gateway as-is and must not
-    // escape the fixed base prefix.
+    // Control: a percent-encoded non-dot path is preserved for transparent
+    // forwarding (never decoded, rewritten, or rejected).
     let response = client
-        .get(format!("{gateway_url}/v1/%2e%2e/outside"))
+        .get(format!("{gateway_url}/v1/models%2Fsub"))
         .header("x-meter-key", "test-meter-key-machine-a")
         .send()
         .await
         .expect("caller reaches gateway");
-    assert!(
-        response.status().is_client_error() || response.status().is_server_error(),
-        "a percent-encoded parent segment must be rejected locally, never forwarded outside the base prefix"
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "a percent-encoded non-dot path still forwards"
     );
 
-    // A literal parent segment is sent via raw TCP so the gateway observes the
-    // raw `/v1/../outside` target (an HTTP client would normalize it away).
-    let status_line = raw_post_complete(
-        gateway_addr,
-        b"GET /v1/../outside HTTP/1.1\r\nHost: gateway\r\nConnection: close\r\nX-Meter-Key: test-meter-key-machine-a\r\n\r\n"
-            .to_vec(),
-        b"",
-    )
-    .await;
-    assert!(
-        String::from_utf8_lossy(&status_line).starts_with("HTTP/1.1 4"),
-        "a literal parent segment must be rejected locally, got: {status_line:?}"
-    );
+    // Dot-segment targets are sent via raw TCP so the gateway observes the raw
+    // request target (an HTTP client would normalize parent segments away
+    // before the gateway ever sees them). Both escaping and in-base, and both
+    // literal and percent-encoded parent segments, must be rejected locally and
+    // never reach the upstream.
+    for target in [
+        "GET /v1/../outside HTTP/1.1",
+        "GET /v1/foo/../models HTTP/1.1",
+        "GET /v1/%2e%2e/outside HTTP/1.1",
+        "GET /v1/foo/%2e%2e/models HTTP/1.1",
+    ] {
+        let status_line = raw_post_complete(
+            gateway_addr,
+            format!(
+                "{target}\r\nHost: gateway\r\nConnection: close\r\nX-Meter-Key: test-meter-key-machine-a\r\n\r\n"
+            )
+            .into_bytes(),
+            b"",
+        )
+        .await;
+        assert!(
+            String::from_utf8_lossy(&status_line).starts_with("HTTP/1.1 4"),
+            "a dot-segment target must be rejected locally, got: {status_line:?}"
+        );
+    }
 
-    // The fake upstream must only ever have observed the single normal request
-    // below the fixed base prefix — never an escaped path.
+    // The fake upstream must only ever have observed the normal and
+    // percent-encoded non-dot control requests below the fixed base prefix —
+    // never a normalized or escaped path.
     {
         let captured = upstream.captured.lock().unwrap();
         assert_eq!(
             captured.len(),
-            1,
-            "only the normal path reaches upstream; dot-dot targets never do"
+            2,
+            "only the normal paths reach upstream; dot-segment targets never do"
         );
         assert_eq!(captured[0].path, "/backend-api/codex/models");
+        assert_eq!(captured[1].path, "/backend-api/codex/models%2Fsub");
     }
 }
 
