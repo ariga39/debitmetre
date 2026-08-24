@@ -103,20 +103,24 @@ the current `debitmetre` binary on a loopback port, points your existing
 authenticated `codex` CLI at it through a temporary model provider, gives it a
 tiny deterministic `add(a,b)` task in a disposable git repository, runs an
 independent Python test, and prints only sanitized pass/fail evidence (task
-test, audit record shape, per-model summary grouping, lifecycle logs). Only
-after the explicit `DEBITMETRE_REAL_E2E=1` opt-in does it contact the real
-Codex upstream through your own authenticated codex login; it never inspects
-OAuth and never prints or persists the synthetic X-Meter key. It is strictly
-opt-in and never runs under `cargo test` or CI:
+test, canonical audit record shape, per-model summary grouping, lifecycle
+logs). Only after the explicit `DEBITMETRE_REAL_E2E=1` opt-in does it contact
+the real Codex upstream through your own authenticated codex login; it never
+inspects OAuth, never prints or persists the synthetic X-Meter key, and never
+retains generated artifacts (all temporary state is removed by a trap). It is
+strictly opt-in and never runs under `cargo test` or CI:
 
 ```sh
 DEBITMETRE_REAL_E2E=1 scripts/e2e-real-codex.sh
 ```
 
 Prerequisites: `cargo`, `codex`, `python3`, `jq`, `curl`, `git`, `sha256sum`,
-`timeout`, `awk`. Without `DEBITMETRE_REAL_E2E=1` the script exits non-zero
-and does nothing. The script header lists the configurable loopback port, step
-timeout, meter key, and `DEBITMETRE_E2E_KEEP=1` artifact-retention flag.
+`timeout`, `mktemp`, `head`, `base64`, `tr`, `cut`, `cat`, `tail`, `sleep`,
+`mkdir`, `rm`, `grep`. Without `DEBITMETRE_REAL_E2E=1` the script exits
+non-zero and does nothing. The script header lists the configurable loopback
+port and step timeout; invalid values (including 0, negatives, fractions, and
+option-like strings) fail before any traffic, and the port must be a free
+integer in `1..65535`.
 
 ### Process-level test
 

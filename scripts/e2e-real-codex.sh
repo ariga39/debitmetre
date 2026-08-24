@@ -14,18 +14,19 @@
 # key is runtime-only (from DEBITMETRE_E2E_METER_KEY or generated); only its
 # SHA-256 digest enters the temporary gateway config, and the raw key is never
 # printed or persisted. No VPS, Docker, nginx, systemd, or fixed deployment is
-# assumed: everything runs on the loopback interface and is torn down by a trap
-# unless DEBITMETRE_E2E_KEEP=1.
+# assumed: everything runs on the loopback interface, is torn down by a trap,
+# and generated artifacts are never retained.
 #
 # Prerequisites: bash, cargo, codex, python3, jq, curl, git, sha256sum,
-# timeout, awk.
+# timeout, mktemp, head, base64, tr, cut, cat, tail, sleep, mkdir, rm, grep.
 #
 # Configurable via environment:
 #   DEBITMETRE_REAL_E2E       must be "1" to run (opt-in guard)
 #   DEBITMETRE_E2E_METER_KEY  synthetic X-Meter key (default: generated)
-#   DEBITMETRE_E2E_PORT       loopback port (default: 18787; fails clearly if occupied)
-#   DEBITMETRE_E2E_TIMEOUT    seconds allowed for the codex step (default: 600)
-#   DEBITMETRE_E2E_KEEP       "1" retains artifacts in the temp dir
+#   DEBITMETRE_E2E_PORT       loopback port (default: 18787; integer 1..65535,
+#                             fails clearly if occupied)
+#   DEBITMETRE_E2E_TIMEOUT    seconds allowed for the codex step (default: 600;
+#                             positive integer bounded at 86400)
 #
 # Exit status: 0 only when every sanitized check passes; any failure exits
 # non-zero after printing a stage-named error. Without the opt-in flag the
@@ -55,14 +56,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-for tool in cargo codex python3 jq curl git sha256sum timeout awk; do
+for tool in cargo codex python3 jq curl git sha256sum timeout mktemp \
+    head base64 tr cut cat tail sleep mkdir rm grep; do
     command -v "$tool" >/dev/null 2>&1 || die prereq "missing prerequisite '$tool'"
 done
 
 # --- parameters ------------------------------------------------------------
 PORT="${DEBITMETRE_E2E_PORT:-18787}"
 TIMEOUT="${DEBITMETRE_E2E_TIMEOUT:-600}"
-KEEP="${DEBITMETRE_E2E_KEEP:-0}"
+
+# --- validate parameters before any traffic --------------------------------
+# Reject invalid values (including 0, negatives, fractions, and option-like
+# strings) before the gateway or codex is ever started.
+if ! [[ "$PORT" =~ ^[0-9]{1,5}$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+    die port "invalid DEBITMETRE_E2E_PORT '$PORT' (expected an integer port 1..65535)"
+fi
+if ! [[ "$TIMEOUT" =~ ^[1-9][0-9]{0,4}$ ]] || [ "$TIMEOUT" -gt 86400 ]; then
+    die timeout "invalid DEBITMETRE_E2E_TIMEOUT '$TIMEOUT' (expected a positive integer of seconds, at most 86400)"
+fi
 
 # --- temporary workspace and cleanup trap ----------------------------------
 WORKDIR="$(mktemp -d)"
@@ -74,11 +85,7 @@ cleanup() {
         wait "$GATEWAY_PID" 2>/dev/null || true
         GATEWAY_PID=""
     fi
-    if [ "$KEEP" = "1" ]; then
-        echo "debitmetre e2e: artifacts kept in $WORKDIR" >&2
-    else
-        rm -rf "$WORKDIR"
-    fi
+    rm -rf "$WORKDIR"
     exit "$rc"
 }
 trap cleanup EXIT
@@ -117,10 +124,15 @@ export DEBITMETRE_E2E_METER_KEY="$KEY"
 DIGEST="$(printf '%s' "$KEY" | sha256sum | cut -d' ' -f1)"
 
 # --- disposable gateway config (digest only, no raw key) -------------------
+# Generated paths are escaped for TOML basic strings so a path with a
+# backslash or double quote can never break or extend the config.
 umask 077
+USAGE_FILE="$WORKDIR/usage.jsonl"
+USAGE_FILE_ESC="${USAGE_FILE//\\/\\\\}"
+USAGE_FILE_ESC="${USAGE_FILE_ESC//\"/\\\"}"
 cat > "$WORKDIR/gateway.toml" <<EOF
 listen = "127.0.0.1:$PORT"
-usage_file = "$WORKDIR/usage.jsonl"
+usage_file = "$USAGE_FILE_ESC"
 
 [machine_keys]
 "$DIGEST" = "machine-e2e"
@@ -213,39 +225,115 @@ GATEWAY_PID=""
 sleep 1
 
 # --- validate audit records; no raw records are printed --------------------
-# Every present usage counter must be a JSON number, integral, and
-# nonnegative; at least one present counter must be positive; the record must
-# carry non-null usage and a non-null model.
+# At least one record must be a canonical schema_version=1 request record with
+# the required lifecycle fields, a non-null model, exactly the seven canonical
+# usage counters, every present counter a number that is integral and
+# nonnegative, and some present counter positive.
 if ! jq -e --slurp '
     any(.[];
-        (.kind == "request")
-        and (.usage != null)
+        (.schema_version == 1)
+        and (.kind == "request")
+        and (.event_id | type == "string")
+        and (.timestamp | type == "string")
+        and (.machine_id | type == "string")
+        and (.operation | type == "string")
+        and (.outcome | type == "string")
+        and (.accounting_quality | type == "string")
+        and (.metering_error == null or (.metering_error | type == "string"))
+        and (.upstream_status == null or (.upstream_status | type == "number"))
         and (.model != null)
-        and (
-            [.usage | to_entries[] | select(.value != null) | .value]
-            | all(.[]; (type == "number") and (floor == .) and (. >= 0))
-        )
-        and (
-            [.usage | to_entries[] | select(.value != null) | .value]
-            | any(.[]; (type == "number") and (. > 0))
-        )
+        and (.usage != null)
+        and (.usage | keys | sort) == ["cache_read", "cache_write", "input_total", "output_total", "reasoning", "total", "uncached"]
+        and ([.usage[] | select(. != null)] | all(.[]; (type == "number") and (floor == .) and (. >= 0)))
+        and ([.usage[] | select(. != null)] | any(.[]; (type == "number") and (. > 0)))
     )' "$WORKDIR/usage.jsonl" >/dev/null 2>&1
 then
-    die validate "no accepted audit record with non-null usage and model, integral nonnegative counters, and nonzero usage"
+    die validate "no canonical schema_version=1 request record with the seven canonical usage counters, a non-null model, and integral nonnegative nonzero usage"
 fi
 
-# --- debitmetre summary: a non-missing model group with nonzero totals -----
-# Only the aggregated row count is reported; per-model names and token totals
+# --- debitmetre summary corresponds to the canonical audit records ---------
+# The expected (machine_id, model) groups and totals are derived from the
+# accepted canonical records; each must appear in the summary with the same
+# record count and a matching positive total. Per-model names and token totals
 # are never printed.
 if ! "$BIN" summary --config "$WORKDIR/gateway.toml" > "$WORKDIR/summary.out" 2> "$WORKDIR/summary.err"; then
     die summary "debitmetre summary command failed"
 fi
-if ! SUMMARY_ROWS="$(awk '
-    NR >= 2 && $1 != "machine" && $2 != "-" && $2 != "=" && $NF ~ /^[0-9]+$/ && $NF > 0 { found = 1; rows++ }
-    END { if (found) print rows; else exit 1 }
-' "$WORKDIR/summary.out")"
+if ! SUMMARY_ROWS="$(python3 - "$WORKDIR/usage.jsonl" "$WORKDIR/summary.out" <<'PY'
+import json
+import sys
+
+usage_file, summary_file = sys.argv[1], sys.argv[2]
+
+groups = {}
+with open(usage_file, encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        rec = json.loads(line)
+        if rec.get("schema_version") != 1 or rec.get("kind") != "request":
+            continue
+        if rec.get("usage") is None or rec.get("model") is None:
+            continue
+        key = (rec.get("machine_id"), rec.get("model"))
+        count, total, present = groups.get(key, (0, 0, False))
+        count += 1
+        value = rec["usage"].get("total")
+        if value is not None:
+            total += value
+            present = True
+        groups[key] = (count, total, present)
+
+if not groups:
+    print("no canonical usage group found in the audit file", file=sys.stderr)
+    sys.exit(1)
+
+rows = {}
+with open(summary_file, encoding="utf-8") as f:
+    lines = f.readlines()
+for line in lines[1:]:
+    fields = line.split()
+    if len(fields) < 10:
+        continue
+    machine, model = fields[0], fields[1]
+    if machine == "-" or model == "-" or model == "=":
+        continue
+    rows[(machine, model)] = fields
+
+ok = True
+for key, (count, total, present) in groups.items():
+    machine, model = key
+    row = rows.get(key)
+    if row is None:
+        print(f"summary missing group machine={machine}", file=sys.stderr)
+        ok = False
+        continue
+    records = int(row[2])
+    total_cell = row[9]
+    if records != count:
+        print(f"summary records mismatch machine={machine}: expected {count} got {records}", file=sys.stderr)
+        ok = False
+    if not present:
+        if total_cell != "-":
+            print(f"summary total should be '-' machine={machine} got {total_cell}", file=sys.stderr)
+            ok = False
+    else:
+        if total_cell == "-" or int(total_cell) != total or total <= 0:
+            print(f"summary total mismatch machine={machine}: expected {total} got {total_cell}", file=sys.stderr)
+            ok = False
+
+if not any(present and total > 0 for (_count, total, present) in groups.values()):
+    print("no canonical usage group has a positive total", file=sys.stderr)
+    ok = False
+
+if not ok:
+    sys.exit(1)
+print(len(groups))
+PY
+)"
 then
-    die summary "debitmetre summary shows no model group with nonzero totals"
+    die summary "debitmetre summary does not correspond to the accepted canonical audit records"
 fi
 
 # --- diagnostic logs: lifecycle events present, no key or body leak --------
@@ -263,13 +351,22 @@ if grep -qF "$MARKER" "$LOG"; then
     die logs "gateway log contains the task body marker"
 fi
 
+# --- the runtime meter key must never appear in any generated artifact ------
+# Scanned before cleanup (the trap removes everything): a leak is a hard
+# failure, not something to preserve or emit.
+if grep -rqF "$KEY" "$WORKDIR" --exclude-dir=.git 2>/dev/null; then
+    die keyleak "raw meter key found in a generated artifact"
+fi
+
 # --- concise sanitized evidence --------------------------------------------
 # Only aggregate counts are printed: never raw records, prompts, responses,
-# model names, or exact token totals.
+# model names, exact token totals, credentials, the Codex transcript, or the
+# task body.
 RECORDS="$(jq --slurp 'length' "$WORKDIR/usage.jsonl")"
 echo "debitmetre e2e: PASS task: independent add(a,b) Python test passed"
-echo "debitmetre e2e: PASS audit: accepted record has non-null usage and model, integral nonnegative counters, nonzero usage"
-echo "debitmetre e2e: PASS summary: debitmetre summary shows a model group with nonzero totals"
+echo "debitmetre e2e: PASS audit: canonical schema_version=1 request record with required lifecycle fields, exactly seven usage counters, non-null model, and integral nonnegative nonzero usage"
+echo "debitmetre e2e: PASS summary: per-model summary groups match the accepted canonical audit records with nonzero totals"
 echo "debitmetre e2e: PASS logs: accepted/upstream lifecycle events; no raw meter key or task body marker"
+echo "debitmetre e2e: PASS artifacts: raw meter key absent from all generated artifacts"
 echo "debitmetre e2e: evidence: codex_exit=$CODEX_EXIT records=$RECORDS port=$PORT"
 echo "debitmetre e2e: evidence: summary_rows=$SUMMARY_ROWS has_nonzero=1"
