@@ -161,11 +161,13 @@ The exact command invocation is documented in [docs/OPERATIONS.md](OPERATIONS.md
   body bytes and ordering received by the client are completely unchanged; audit records may be lost.
 - Metering parse failures, malformed data, and audit failures must never change the already-received upstream
   status/header/body, and must never proactively cancel a request that could otherwise continue.
-- Runtime diagnostics: emit sanitized events to stderr logging only the allowlisted fields — the stable
-  `machine_id`, request `operation` (route), `outcome`, and upstream `status` (`audit_write_failed` /
-  `audit_dropped`); credentials, `Authorization`/OAuth material, bodies, ChatGPT account or upstream
-  request identifiers, raw headers, and client network metadata are forbidden. The MVP has no metrics
-  system, dashboard, or detailed labels.
+- Runtime diagnostics: emit sanitized events to stderr. Request-lifecycle diagnostics may include the
+  allowlisted stable `machine_id`, request route/operation, `outcome`, and upstream `status`; other
+  diagnostics (startup, configuration, shutdown) may include necessary non-secret operational context.
+  The following are forbidden in all cases: meter keys/credentials, `Authorization`/OAuth material,
+  request or response bodies, ChatGPT account or upstream request identifiers, raw headers, and client
+  network metadata (`audit_write_failed` / `audit_dropped` are examples). The MVP has no metrics system,
+  dashboard, or detailed labels.
 
 ## 7. Storage semantics
 

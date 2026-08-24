@@ -23,19 +23,19 @@ journald, or an operator-selected supervisor).
 
 ### Optional system-wide install
 
-A system-wide install is optional and is left to the operator. Choose a dedicated runtime user, create and
-chown the configuration and data locations to that user, and run the binary as that user. The repository
-ships only the TOML example; it does not ship or prescribe a supervisor, service unit, or service user.
+A system-wide install is optional and is left to the operator. Optionally install the single binary onto the
+system, then arrange the config and data locations (create them and set their ownership) for whichever
+runtime user and supervisor the operator chooses. The repository ships only the TOML example; it does not
+ship or prescribe a supervisor, service unit, service user, or one universal account.
 
 ```sh
-sudo useradd --system --home-dir /var/lib/debitmetre --shell /usr/sbin/nologin debitmetre
-sudo install -d -o debitmetre -g debitmetre /etc/debitmetre /var/lib/debitmetre
-sudo install -m 0600 -o debitmetre -g debitmetre config.example.toml /etc/debitmetre/config.toml
-sudo -u debitmetre debitmetre --config /etc/debitmetre/config.toml
+sudo install -m 0755 target/release/debitmetre /usr/local/bin/debitmetre
 ```
 
-`usage_file` in the installed config must be a path the runtime user owns and can write, for example
-`/var/lib/debitmetre/usage.jsonl`.
+The operator must then create the configuration and usage-file directories, set their ownership to the
+chosen runtime user, and place `config.example.toml` (with `usage_file` pointing at a path that user can
+write) where the binary can read it as that user. For example, with a runtime user and paths of the
+operator's choosing, `usage_file` could be `/var/lib/debitmetre/usage.jsonl`.
 
 ## Configuration
 
@@ -66,18 +66,21 @@ blank machine id all exit non-zero with a useful error. The configured `usage_fi
 same way: an invalid or unwritable path prevents startup.
 
 After a successful startup, a transient audit write failure is **fail-open**: the caller-visible upstream
-response stays unchanged and a sanitized `audit_write_failed` diagnostic is emitted to stderr. Runtime
-diagnostics log only the allowlisted fields below; they never include credentials, bodies, raw headers,
-account or upstream request identifiers, or client network metadata. See DESIGN.md §6–§7 for the full
-contract.
+response stays unchanged and a sanitized `audit_write_failed` diagnostic is emitted to stderr. Request
+lifecycle diagnostics may include the allowlisted `machine_id`, route/operation, `outcome`, and upstream
+`status`; other diagnostics may include necessary non-secret operational context. None ever include
+credentials, bodies, raw headers, account or upstream request identifiers, or client network metadata. See
+DESIGN.md §6–§7 for the full contract.
 
 ## Logging and privacy
 
-Operational logs go to stderr. The allowlisted fields the gateway intentionally logs are the stable
-`machine_id`, the request `operation` (route), the `outcome`, and the upstream `status`. The following are
-**forbidden** from any log or diagnostic: meter keys/credentials, `Authorization`/OAuth material, request or
-response bodies, ChatGPT account or upstream request identifiers, raw headers, and client network metadata
-(for example IP addresses). The audit record itself is governed by the stricter allowlist in DESIGN.md §5.
+Operational logs go to stderr. Request-lifecycle diagnostics may include the allowlisted stable
+`machine_id`, the request `operation` (route), the `outcome`, and the upstream `status`. Other diagnostics
+(startup, configuration, and shutdown) may include necessary non-secret operational context such as event
+names, the listen address, machine count, reason, and the config path. The following are **forbidden** from
+any log or diagnostic: meter keys/credentials, `Authorization`/OAuth material, request or response bodies,
+ChatGPT account or upstream request identifiers, raw headers, and client network metadata (for example IP
+addresses). The audit record itself is governed by the stricter allowlist in DESIGN.md §5.
 
 ## Readiness and routing
 
