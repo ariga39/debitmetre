@@ -124,12 +124,34 @@ export DEBITMETRE_E2E_METER_KEY="$KEY"
 DIGEST="$(printf '%s' "$KEY" | sha256sum | cut -d' ' -f1)"
 
 # --- disposable gateway config (digest only, no raw key) -------------------
-# Generated paths are escaped for TOML basic strings so a path with a
-# backslash or double quote can never break or extend the config.
+# The usage_file path is serialized as a TOML basic string by python3 (an
+# existing prerequisite), so a path containing backslashes, double quotes,
+# newlines, tabs, carriage returns, or any other control character is always
+# escaped correctly and can never break or extend the config.
 umask 077
 USAGE_FILE="$WORKDIR/usage.jsonl"
-USAGE_FILE_ESC="${USAGE_FILE//\\/\\\\}"
-USAGE_FILE_ESC="${USAGE_FILE_ESC//\"/\\\"}"
+USAGE_FILE_ESC="$(python3 - "$USAGE_FILE" <<'PY'
+import sys
+
+
+def toml_basic(value):
+    out = []
+    for ch in value:
+        code = ord(ch)
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif code < 0x20 or code == 0x7F:
+            out.append("\\u%04x" % code)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+print(toml_basic(sys.argv[1]))
+PY
+)"
 cat > "$WORKDIR/gateway.toml" <<EOF
 listen = "127.0.0.1:$PORT"
 usage_file = "$USAGE_FILE_ESC"
@@ -231,17 +253,30 @@ sleep 1
 # nonnegative, and some present counter positive.
 if ! jq -e --slurp '
     any(.[];
-        (.schema_version == 1)
+        (. | keys | sort) == [
+            "accounting_quality", "event_id", "kind", "machine_id",
+            "metering_error", "model", "operation", "outcome",
+            "schema_version", "timestamp", "upstream_status", "usage"
+        ]
+        and (.schema_version == 1)
         and (.kind == "request")
+        and ((.machine_id | type == "string") and (.machine_id | length > 0))
+        and ((.model | type == "string") and (.model | length > 0))
+        and (.operation == "response" or .operation == "compaction")
+        and (.outcome == "completed" or .outcome == "incomplete"
+            or .outcome == "upstream_error" or .outcome == "transport_error"
+            or .outcome == "upstream_interrupted" or .outcome == "client_cancelled")
+        and (.accounting_quality == "complete" or .accounting_quality == "partial"
+            or .accounting_quality == "inconsistent" or .accounting_quality == "unavailable")
+        and (.metering_error == null or .metering_error == "missing_usage"
+            or .metering_error == "malformed_usage" or .metering_error == "event_too_large")
+        and (.upstream_status == null
+            or ((.upstream_status | type == "number") and (.upstream_status | floor == .)
+                and (.upstream_status >= 100) and (.upstream_status <= 599)))
         and (.event_id | type == "string")
+        and (.event_id | test("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"))
         and (.timestamp | type == "string")
-        and (.machine_id | type == "string")
-        and (.operation | type == "string")
-        and (.outcome | type == "string")
-        and (.accounting_quality | type == "string")
-        and (.metering_error == null or (.metering_error | type == "string"))
-        and (.upstream_status == null or (.upstream_status | type == "number"))
-        and (.model != null)
+        and (.timestamp | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
         and (.usage != null)
         and (.usage | keys | sort) == ["cache_read", "cache_write", "input_total", "output_total", "reasoning", "total", "uncached"]
         and ([.usage[] | select(. != null)] | all(.[]; (type == "number") and (floor == .) and (. >= 0)))
@@ -354,7 +389,7 @@ fi
 # --- the runtime meter key must never appear in any generated artifact ------
 # Scanned before cleanup (the trap removes everything): a leak is a hard
 # failure, not something to preserve or emit.
-if grep -rqF "$KEY" "$WORKDIR" --exclude-dir=.git 2>/dev/null; then
+if grep -rqF --exclude-dir=.git -- "$KEY" "$WORKDIR" 2>/dev/null; then
     die keyleak "raw meter key found in a generated artifact"
 fi
 
