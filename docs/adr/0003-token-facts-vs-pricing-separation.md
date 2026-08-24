@@ -28,3 +28,10 @@ not gateway behavior.
 
 Embedded pricing/daily reports inside the gateway were rejected because they let an external variable (prices) invade the hot-path audit semantics
 and force the audit schema to carry mutable snapshot data.
+
+## Amendment (2026-08, issue #27)
+
+The shipped `debitmetre summary` command aggregates the recorded raw token facts by machine and model and
+reports metering coverage, as a local offline read of the audit file. This is a token-facts-only aggregation
+consistent with this decision; it still does not compute prices, equivalent cost, or daily billing reports,
+which remain future independent offline outcomes.

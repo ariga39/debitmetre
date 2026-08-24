@@ -1,8 +1,10 @@
 # Survey of Codex community proxies and usage-metering implementations
 
-Date: 2026-08-23
-
-> **Authority boundary**: this document is evidence input from the time of the survey, **not the current specification**.
+> **Status: historical evidence — dated 2026-08-23, non-authoritative, and not the current implementation plan.**
+> This document is a snapshot of community research from the date above. It was written before much of the
+> current behavior shipped, so its suggestions must not be read as current requirements or as the current
+> roadmap. Some suggestions were superseded or rejected by later rulings; treat this file as provenance only.
+>
 > The only authoritative current design is [../DESIGN.md](../DESIGN.md) (per issue #1 and the batch grill rulings,
 > process in [../DESIGN-REVIEW.md](../DESIGN-REVIEW.md)).
 > Wherever this document conflicts with DESIGN.md it has been superseded by the official design, in particular:
@@ -12,6 +14,8 @@ Date: 2026-08-23
 > - daily reports/reconciliation/importer → excluded from the gateway MVP, as future independent outcomes.
 > - Token accounting follows the mutually exclusive buckets + accounting_quality of DESIGN.md §4;
 >   the audit line model follows the per-request lifecycle record of §5.
+
+Date: 2026-08-23
 
 ## Conclusion
 
@@ -68,7 +72,12 @@ The event also stores `accounting_quality = complete | inconsistent | partial`. 
 
 The official OpenAI Codex source already parses cache-write tokens, as well as `x-codex-primary-*`, `x-codex-secondary-*`, and `codex.rate_limits`; therefore the audit model should split token usage and quota snapshot into two kinds of events.
 
-## Suggested implementation slices
+## Suggested implementation slices (historical, superseded as a plan)
+
+These slices were a research-time proposal for how the MVP might be built, written before the current
+implementation. They are **not** the current plan and some were later rejected or superseded (for example,
+bounded global body budget and offline reporting were moved out of MVP scope). Current scope and TDD seams
+are defined only by [../DESIGN.md](../DESIGN.md) §9–§10.
 
 1. Protocol PoC: confirm the actual routes, request content-encoding, compact response, terminal SSE event size, and quota fields.
 2. Fixed routes and machine authentication: allow only Responses/compact; keep the OAuth Authorization header, strip gateway-owned headers.
