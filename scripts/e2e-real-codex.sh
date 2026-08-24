@@ -8,8 +8,9 @@
 # diagnostic task (interacting loader/aggregate/CLI with two seeded defects;
 # issue #31) in a disposable git repository, proves the independent acceptance
 # command fails before Codex runs, runs the explicit installed `gpt-5.6-luna`
-# model, and proves the same acceptance command passes afterward while the task
-# README, fixture, and acceptance test stay byte-for-byte unchanged. It reports
+# model, and proves the same acceptance command passes afterward after any
+# protected-file edits are discarded (the task README, fixture, and acceptance
+# test cannot influence the result). It reports
 # only sanitized pass/fail evidence for task success, canonical usage, model
 # attribution, per-model summary, and diagnostic logs. It also explicitly
 # proves (from sanitized method/route/status lifecycle-log evidence) that the
@@ -197,7 +198,9 @@ fi
 # The generated task (issue #31) has an interacting loader/aggregate/CLI chain
 # and two seeded defects; the acceptance command must fail before Codex runs
 # and pass after it. README.md, data/orders.txt, and test_report.py are
-# protected contract files; only the source modules under src/ may change.
+# protected contract files that define the acceptance and cannot influence it
+# (any edits to them are discarded); only the source modules under src/ may
+# carry the repair.
 "$REPO_ROOT/scripts/gen-diagnostic-task.sh" "$WORKDIR/task-repo" >/dev/null
 
 # --- honest red evidence before Codex runs ---------------------------------
@@ -210,7 +213,11 @@ fi
 echo "debitmetre e2e: red evidence: independent acceptance failed before Codex ran"
 
 # --- snapshot protected-file and source digests to prove repair provenance --
-PROTECTED_DIGEST="$( (cd "$WORKDIR/task-repo" && sha256sum README.md data/orders.txt data/orders2.txt test_report.py) )"
+# README.md, the data fixtures, and test_report.py are protected contract files
+# whose committed bytes define the acceptance; only the source modules under
+# src/ may carry the repair.
+PROTECTED=(README.md data/orders.txt data/orders2.txt test_report.py)
+PROTECTED_DIGEST="$( (cd "$WORKDIR/task-repo" && sha256sum "${PROTECTED[@]}") )"
 SRC_DIGEST_BEFORE="$( (cd "$WORKDIR/task-repo" && sha256sum src/loader.py src/aggregate.py src/main.py) )"
 
 # --- run the authenticated codex CLI against the local gateway -------------
@@ -236,15 +243,25 @@ else
     die codex "codex exec failed (exit $CODEX_EXIT after up to ${TIMEOUT}s)"
 fi
 
-# --- the repair must come from real source changes, not protected-file edits -
-if [ "$( (cd "$WORKDIR/task-repo" && sha256sum README.md data/orders.txt test_report.py) )" != "$PROTECTED_DIGEST" ]; then
-    die protected "a protected task file (README, fixture, or acceptance test) changed"
+# --- protected edits must never influence acceptance ------------------------
+# After Codex exits, restore the protected contract files to their committed
+# bytes, regardless of how the model behaved. A run can only pass through real
+# source repairs; protected edits cannot game the acceptance.
+git -C "$WORKDIR/task-repo" checkout -- "${PROTECTED[@]}"
+
+# Confirm the restoration: the protected files must equal their committed bytes.
+if [ "$( (cd "$WORKDIR/task-repo" && sha256sum "${PROTECTED[@]}") )" != "$PROTECTED_DIGEST" ]; then
+    die protected "a protected task file (README, fixture, or acceptance test) could not be restored to its committed bytes"
 fi
+
+# A run must still fail if Codex changed no source module.
 if [ "$( (cd "$WORKDIR/task-repo" && sha256sum src/loader.py src/aggregate.py src/main.py) )" = "$SRC_DIGEST_BEFORE" ]; then
     die source "no source module changed; the pass must come from real source repairs"
 fi
 
 # --- independent Python test (the task's ground truth) ---------------------
+# Run the original acceptance against the restored protected files and the
+# remaining source changes; it must pass here.
 if ! "$REPO_ROOT/scripts/check-diagnostic-task.sh" "$WORKDIR/task-repo" \
     > "$WORKDIR/test.out" 2>&1; then
     die test "independent order-report test failed after Codex: $(tail -1 "$WORKDIR/test.out" 2>/dev/null || true)"
@@ -450,7 +467,7 @@ echo "debitmetre e2e: PASS summary: per-model summary groups match the accepted 
 echo "debitmetre e2e: PASS models: GET /v1/models accepted with a 2xx upstream response (sanitized method/route/status evidence)"
 echo "debitmetre e2e: PASS logs: accepted/upstream lifecycle events; no raw meter key or task body marker"
 echo "debitmetre e2e: PASS artifacts: raw meter key absent from all generated artifacts"
-echo "debitmetre e2e: PASS protected: task README, fixture, and acceptance test byte-for-byte unchanged; only source modules changed"
+echo "debitmetre e2e: PASS protected: task README, fixture, and acceptance test restored to committed bytes (protected edits cannot influence acceptance); source modules changed"
 echo "debitmetre e2e: evidence: codex_exit=$CODEX_EXIT records=$RECORDS port=$PORT"
 echo "debitmetre e2e: evidence: summary_rows=$SUMMARY_ROWS has_nonzero=1"
 echo "debitmetre e2e: evidence: model_discovery=accepted_2xx"
