@@ -36,10 +36,10 @@ use uuid::Uuid;
 const AUDIT_QUEUE_CAPACITY: usize = 2048;
 
 /// `kind` is fixed by the canonical schema (DESIGN.md §5).
-const KIND: &str = "request";
+pub(crate) const KIND: &str = "request";
 
 /// `schema_version` is fixed by the canonical schema (DESIGN.md §5).
-const SCHEMA_VERSION: u8 = 1;
+pub(crate) const SCHEMA_VERSION: u8 = 1;
 
 /// Static, sanitized one-shot warning printed to stderr on the first audit
 /// write failure. No path, machine, request, or credential detail is echoed.

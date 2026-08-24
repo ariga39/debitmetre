@@ -159,6 +159,19 @@ fn run_summary(config_path: &Path) -> (ExitStatus, String, String) {
     )
 }
 
+/// Two serde-deserializable records that are NOT valid canonical `kind=request`
+/// records: one carries a wrong `schema_version`, one a wrong `kind`. Their
+/// usage is conspicuous so any accidental inclusion would be plainly visible in
+/// the literal expected output. Neither may enter the coverage counts or any
+/// token group (issue #23 spec blocker).
+fn non_canonical_records() -> String {
+    [
+        r#"{"schema_version":2,"kind":"request","event_id":"evt-bad-version","timestamp":"2026-08-23T10:00:00Z","machine_id":"machine-bad","operation":"response","upstream_status":200,"outcome":"completed","model":"model-bad","accounting_quality":"complete","metering_error":null,"usage":{"input_total":9999,"uncached":0,"cache_read":0,"cache_write":0,"output_total":999,"reasoning":0,"total":10998}}"#,
+        r#"{"schema_version":1,"kind":"meter_snapshot","event_id":"evt-bad-kind","timestamp":"2026-08-23T10:00:00Z","machine_id":"machine-bad","operation":"response","upstream_status":200,"outcome":"completed","model":"model-bad","accounting_quality":"complete","metering_error":null,"usage":{"input_total":8888,"uncached":0,"cache_read":0,"cache_write":0,"output_total":888,"reasoning":0,"total":9776}}"#,
+    ]
+    .join("\n")
+}
+
 /// The base fixture (see [`base_fixture`]) contains 5 valid canonical
 /// `kind=request` lifecycles: 4 carry a non-null `usage` object (evt-a1, evt-a2,
 /// evt-a3, evt-b1, including the partial evt-a3) and 1 carries `usage: null`
@@ -166,17 +179,28 @@ fn run_summary(config_path: &Path) -> (ExitStatus, String, String) {
 /// These counts are independently known from the fixture itself, not derived
 /// from the renderer. `EXPECTED_BASE_STDOUT` includes the coverage line.
 #[test]
-fn summary_prints_overall_metering_coverage() {
+fn non_canonical_records_do_not_enter_coverage_or_token_totals() {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let usage_file = dir.path().join("usage.jsonl");
-    std::fs::write(&usage_file, base_fixture()).expect("write synthetic usage file");
+    // Base fixture plus two wrong-version/wrong-kind records with conspicuous
+    // usage. If either slipped through, the counts, coverage, and token rows
+    // would all deviate from the literal expected output below.
+    let mut contents = base_fixture();
+    contents.push_str(&non_canonical_records());
+    contents.push('\n');
+    std::fs::write(&usage_file, contents).expect("write synthetic usage file");
     let config_path = write_config(&dir, &usage_file);
 
     let (status, stdout, stderr) = run_summary(&config_path);
     assert!(status.success(), "summary exits zero, stderr: {stderr}");
-    // The per-machine/per-model token rows are unchanged; the coverage line is
-    // appended after them with the independently known counts and percentage.
+    // The per-machine/per-model token rows and the coverage line are exactly
+    // the base fixture's literal output: both non-canonical records are absent
+    // from accepted/metered/unmetered counts and from every token group.
     assert_eq!(stdout, EXPECTED_BASE_STDOUT);
+    assert!(
+        !stdout.contains("machine-bad"),
+        "non-canonical records create no token group"
+    );
     assert!(
         !stderr.contains("unfinished trailing line"),
         "no coverage warnings expected, got: {stderr}"

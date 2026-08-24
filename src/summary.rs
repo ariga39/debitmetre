@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 
-use crate::usage::{AuditRecord, Usage};
+use crate::usage::{AuditRecord, Usage, KIND, SCHEMA_VERSION};
 
 /// Aggregation key: stable machine id plus the recorded model. A record whose
 /// model is missing still forms a group under a `-` model label; a model is
@@ -109,7 +109,11 @@ fn read_usage_file(
             record = stripped;
         }
         match serde_json::from_slice::<AuditRecord>(record) {
-            Ok(record) => {
+            // Only a valid canonical `kind=request` record (the schema version
+            // and kind the gateway actually writes) is a lifecycle; a line that
+            // serde-validates but carries a wrong version or kind is not
+            // canonical and contributes neither coverage nor token facts.
+            Ok(record) if record.schema_version == SCHEMA_VERSION && record.kind == KIND => {
                 // Every valid canonical record is one accepted lifecycle, with
                 // or without usage; a non-null usage object is metered.
                 coverage.accepted += 1;
@@ -121,6 +125,7 @@ fn read_usage_file(
                     accumulate_usage(groups.entry(key).or_default(), &usage);
                 }
             }
+            Ok(_) => {}
             Err(_) if terminated => warnings.unparseable += 1,
             Err(_) => {
                 // A crash can leave a trailing unfinished line (DESIGN.md §7).
