@@ -125,6 +125,12 @@ pub(crate) struct AuditRecord {
     pub(crate) model: Option<String>,
     pub(crate) accounting_quality: AccountingQuality,
     pub(crate) metering_error: Option<MeteringError>,
+    /// The reasoning effort the caller declared in the request body verbatim
+    /// (`reasoning.effort`), if it declared one (issue #36). Absent stays `null`;
+    /// the gateway never invents or default-fills an effort. `#[serde(default)]`
+    /// keeps records written before this field readable.
+    #[serde(default)]
+    pub(crate) reasoning_effort: Option<String>,
     pub(crate) usage: Option<Usage>,
 }
 
@@ -145,9 +151,131 @@ impl AuditRecord {
             model: None,
             accounting_quality: AccountingQuality::Unavailable,
             metering_error: None,
+            reasoning_effort: None,
             usage: None,
         }
     }
+}
+
+/// Shared observation of the caller's request body for the single declared
+/// reasoning-effort fact (issue #36). A streaming observer mirrors the forwarded
+/// request bytes without changing them; once the lifecycle finalizes the mirror
+/// is decoded (when the request declared a supported `Content-Encoding`) and
+/// parsed exactly once, and only the verbatim `reasoning.effort` string leaves
+/// this observer. The mirror is released on parse, and a compressed body is
+/// streamed through the decoder so no full decompressed copy is materialized.
+///
+/// Forwarding is never affected: the original compressed bytes and the
+/// `Content-Encoding` header are forwarded unchanged, and decoding happens only
+/// on the observer's private copy. Supported observation encodings are
+/// `identity`/none and `zstd` (the encoding the Codex client enables for
+/// Responses requests); any other or layered encoding is *unobserved* — the
+/// effort cannot be read and is recorded absent, never invented. A request body
+/// that is genuinely not received (early failure or cancellation) is likewise
+/// unobserved, by design: the gateway never delays or prereads the forwarded
+/// stream to recover bytes it did not receive.
+pub(crate) struct RequestEffort {
+    encoding: Option<String>,
+    mirror: Vec<u8>,
+    effort: Option<String>,
+    parsed: bool,
+}
+
+impl RequestEffort {
+    pub(crate) fn new(encoding: Option<String>) -> Self {
+        RequestEffort {
+            encoding,
+            mirror: Vec::new(),
+            effort: None,
+            parsed: false,
+        }
+    }
+
+    /// Mirror one forwarded request chunk; the caller's bytes are untouched.
+    /// Each byte is retained once and the whole mirror is decoded and parsed a
+    /// single time by [`RequestEffort::finish`]; there is no per-chunk reparse.
+    pub(crate) fn observe(&mut self, chunk: &[u8]) {
+        if self.parsed {
+            return;
+        }
+        self.mirror.extend_from_slice(chunk);
+    }
+
+    /// Decode and parse the mirror exactly once at audit finalization (the
+    /// normal accepted flow completes the request body before the terminal
+    /// response); later calls are no-ops. It never runs on the forwarding path,
+    /// so request EOF is not delayed. A partial mirror from an early
+    /// failure/cancel simply fails to decode/parse and records no effort.
+    pub(crate) fn finish(&mut self) {
+        if self.parsed {
+            return;
+        }
+        self.parsed = true;
+        let mirror = std::mem::take(&mut self.mirror);
+        self.effort = declared_effort_from(&mirror, self.encoding.as_deref());
+    }
+
+    /// The declared effort copied verbatim, if the decoded body parsed as JSON
+    /// and declared one; `None` when the fact was not observed (no declaration,
+    /// or a body/encoding the gateway does not decode).
+    pub(crate) fn effort(&self) -> Option<String> {
+        self.effort.clone()
+    }
+}
+
+/// The supported request-body content encodings for effort observation. `zstd`
+/// is the encoding the Codex Responses client enables; `identity`/none is the
+/// documented custom-provider flow. Anything else (or a layered encoding) is
+/// left unobserved rather than guessed at.
+enum EncodingKind {
+    Identity,
+    Zstd,
+    Unsupported,
+}
+
+fn encoding_kind(encoding: Option<&str>) -> EncodingKind {
+    let Some(value) = encoding else {
+        return EncodingKind::Identity;
+    };
+    let mut tokens = value
+        .split(',')
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty());
+    match (tokens.next(), tokens.next()) {
+        (None, _) => EncodingKind::Identity,
+        (Some(token), None) if token == "identity" => EncodingKind::Identity,
+        (Some(token), None) if token == "zstd" => EncodingKind::Zstd,
+        _ => EncodingKind::Unsupported,
+    }
+}
+
+/// The minimal shape needed to read the declared effort. Serde ignores every
+/// other field, so the whole request body is never retained as a JSON value.
+#[derive(Deserialize)]
+struct DeclaredReasoning {
+    reasoning: Option<DeclaredReasoningDetail>,
+}
+
+#[derive(Deserialize)]
+struct DeclaredReasoningDetail {
+    effort: Option<String>,
+}
+
+/// Read the declared effort from the observer's private mirror according to the
+/// forwarded `Content-Encoding`; the original forwarded bytes are never touched.
+/// For none/`identity` the bytes are parsed in place. For `zstd` the established
+/// decoder is streamed straight into serde, so the full decompressed prompt is
+/// never materialized as a buffer. Any other or layered encoding is unobserved.
+fn declared_effort_from(raw: &[u8], encoding: Option<&str>) -> Option<String> {
+    let declared: DeclaredReasoning = match encoding_kind(encoding) {
+        EncodingKind::Identity => serde_json::from_slice(raw).ok()?,
+        EncodingKind::Zstd => {
+            let decoder = zstd::stream::read::Decoder::new(raw).ok()?;
+            serde_json::from_reader(decoder).ok()?
+        }
+        EncodingKind::Unsupported => return None,
+    };
+    declared.reasoning?.effort
 }
 
 /// Result of extracting usage from a completed stream.

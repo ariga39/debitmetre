@@ -2,8 +2,9 @@
 
 A central transparent proxy gateway that sits between multiple Codex clients and the single OpenAI Codex
 upstream. For each accepted request lifecycle it best-effort attempts one canonical audit record — raw
-token facts per machine and model — in an append-only JSONL file; usage or model may be absent per the
-contract. It can also summarize what it recorded.
+token facts per machine and model, plus the reasoning effort the request declared — in an append-only JSONL
+file; usage, model, or declared effort may be absent per the contract. It can also summarize what it
+recorded.
 
 It does **not** compute prices, equivalent cost, or daily billing reports — those are future offline outcomes.
 
@@ -56,8 +57,9 @@ traffic under `/v1` is forwarded (including Codex model discovery on
 target/release/debitmetre summary --config ./debitmetre.toml
 ```
 
-The summary aggregates the recorded token facts by machine and model and reports the overall metering
-coverage of accepted request lifecycles. It does not calculate prices, equivalent cost, or daily billing.
+The summary aggregates the recorded token facts by machine and model, and by the declared reasoning effort
+(with a request that declared none kept in an unlabelled row), and reports the overall metering coverage of
+accepted request lifecycles. It does not calculate prices, equivalent cost, or daily billing.
 For a system-wide install under an operator-selected supervisor, see [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ## Documentation
