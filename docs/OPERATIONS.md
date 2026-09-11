@@ -139,11 +139,18 @@ target/release/debitmetre summary --config ./debitmetre.toml
 
 The output is a fixed-width table (machine, model, record count, then input, uncached, cache-read,
 cache-write, output, reasoning, and total tokens). Totals sum only the values actually recorded; a counter
-that was never recorded shows `-` and is never invented as 0, and no prices are computed. A final coverage
+that was never recorded shows `-` and is never invented as 0, and no prices are computed. A second table
+below it breaks the same token totals down by the reasoning effort each request declared (the verbatim
+`reasoning.effort` value); requests that declared no effort are kept in an explicit unlabelled `-` row
+rather than being folded into any specific effort. A final coverage
 line reports the overall metering coverage of accepted request lifecycles: every valid canonical record
 contributes one accepted lifecycle, and one whose record carries a non-null usage object counts as metered
 (partial usage still counts). An unfinished trailing line left by a process crash is ignored with a warning
 while earlier complete records are still summarized. Warnings go to stderr.
+
+The declared-effort observation reads an identity-encoded JSON request body for the single
+`reasoning.effort` string; the gateway does not decompress request bodies, so a compressed body leaves the
+effort unobserved and recorded as `null` (never invented).
 
 The summary is a local read of the audit file; it does not calculate prices, equivalent cost, or daily
 billing reports.

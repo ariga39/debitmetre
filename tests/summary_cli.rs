@@ -25,7 +25,34 @@ fn write_config(dir: &tempfile::TempDir, usage_file: &Path) -> PathBuf {
 }
 
 /// One canonical request audit line (DESIGN.md §5). `uncached`/`reasoning`
-/// accept "null" to exercise the missing-value path.
+/// accept "null" to exercise the missing-value path. `reasoning_effort` is the
+/// raw JSON value for the declared-effort field; `None` omits the field
+/// entirely, mimicking a record written before issue #36.
+#[allow(clippy::too_many_arguments)]
+fn record_with_effort(
+    event_id: &str,
+    machine_id: &str,
+    model: &str,
+    input: &str,
+    uncached: &str,
+    cache_read: &str,
+    cache_write: &str,
+    output: &str,
+    reasoning: &str,
+    total: &str,
+    reasoning_effort: Option<&str>,
+) -> String {
+    let effort_field = match reasoning_effort {
+        Some(value) => format!(",\"reasoning_effort\":\"{value}\""),
+        None => String::new(),
+    };
+    format!(
+        "{{\"schema_version\":1,\"kind\":\"request\",\"event_id\":\"{event_id}\",\"timestamp\":\"2026-08-23T10:00:00Z\",\"machine_id\":\"{machine_id}\",\"operation\":\"response\",\"upstream_status\":200,\"outcome\":\"completed\",\"model\":\"{model}\",\"accounting_quality\":\"complete\",\"metering_error\":null{effort_field},\"usage\":{{\"input_total\":{input},\"uncached\":{uncached},\"cache_read\":{cache_read},\"cache_write\":{cache_write},\"output_total\":{output},\"reasoning\":{reasoning},\"total\":{total}}}}}"
+    )
+}
+
+/// One canonical request audit line with no declared effort; the field is
+/// omitted so it also exercises old-record backward compatibility.
 #[allow(clippy::too_many_arguments)]
 fn record(
     event_id: &str,
@@ -39,8 +66,18 @@ fn record(
     reasoning: &str,
     total: &str,
 ) -> String {
-    format!(
-        "{{\"schema_version\":1,\"kind\":\"request\",\"event_id\":\"{event_id}\",\"timestamp\":\"2026-08-23T10:00:00Z\",\"machine_id\":\"{machine_id}\",\"operation\":\"response\",\"upstream_status\":200,\"outcome\":\"completed\",\"model\":\"{model}\",\"accounting_quality\":\"complete\",\"metering_error\":null,\"usage\":{{\"input_total\":{input},\"uncached\":{uncached},\"cache_read\":{cache_read},\"cache_write\":{cache_write},\"output_total\":{output},\"reasoning\":{reasoning},\"total\":{total}}}}}"
+    record_with_effort(
+        event_id,
+        machine_id,
+        model,
+        input,
+        uncached,
+        cache_read,
+        cache_write,
+        output,
+        reasoning,
+        total,
+        None,
     )
 }
 
@@ -127,6 +164,9 @@ const EXPECTED_BASE_STDOUT: &str = r#"machine       model            records    
 machine-a     model-m1               2          300          210           50           40          130           70          430
 machine-a     model-m2               1           40            -           10           10           20            -           60
 machine-b     model-m1               1           10            5            3            2            6            2           16
+
+effort         records        input     uncached   cache_read  cache_write       output    reasoning        total
+-                    4          350          215           63           52          156           72          506
 - = not recorded in any record; totals sum only recorded values
 coverage: accepted=5 metered=4 unmetered=1 (80.0%)
 "#;
@@ -139,8 +179,96 @@ machine-a     model-m1               2          300          210           50   
 machine-a     model-m2               1           40            -           10           10           20            -           60
 machine-b     model-m1               1           10            5            3            2            6            2           16
 machine-b     model-m2               1           22           11            5            6           12            4           34
+
+effort         records        input     uncached   cache_read  cache_write       output    reasoning        total
+-                    5          372          226           68           58          168           76          540
 - = not recorded in any record; totals sum only recorded values
 coverage: accepted=6 metered=5 unmetered=1 (83.3%)
+"#;
+
+/// Mixed declared efforts for the same machine/model (issue #36): two `xhigh`
+/// records, one `medium` record, and one record that declares no effort (the
+/// field is omitted, exactly like a record written before this change). The
+/// per-effort totals are hand-calculated in [`EXPECTED_EFFORT_STDOUT`].
+fn effort_fixture() -> String {
+    [
+        record_with_effort(
+            "evt-e1",
+            "machine-a",
+            "model-m1",
+            "100",
+            "60",
+            "20",
+            "20",
+            "50",
+            "30",
+            "150",
+            Some("xhigh"),
+        ),
+        record_with_effort(
+            "evt-e2",
+            "machine-a",
+            "model-m1",
+            "200",
+            "150",
+            "30",
+            "20",
+            "80",
+            "40",
+            "280",
+            Some("xhigh"),
+        ),
+        record_with_effort(
+            "evt-e3",
+            "machine-a",
+            "model-m1",
+            "40",
+            "null",
+            "10",
+            "10",
+            "20",
+            "null",
+            "60",
+            None,
+        ),
+        record_with_effort(
+            "evt-e4",
+            "machine-a",
+            "model-m1",
+            "10",
+            "5",
+            "3",
+            "2",
+            "6",
+            "2",
+            "16",
+            Some("medium"),
+        ),
+    ]
+    .join("\n")
+        + "\n"
+}
+
+/// Complete expected stdout for [`effort_fixture`]. The per-effort token totals
+/// are independently hand-calculated from the fixture, not derived from the
+/// renderer:
+///
+/// - `xhigh` (evt-e1 + evt-e2): input=300, uncached=210, cache_read=50,
+///   cache_write=40, output=130, reasoning=70, total=430
+/// - `medium` (evt-e4): input=10, uncached=5, cache_read=3, cache_write=2,
+///   output=6, reasoning=2, total=16
+/// - unlabelled `-` (evt-e3, no effort declared): input=40, cache_read=10,
+///   cache_write=10, output=20, total=60, with `uncached` and `reasoning`
+///   never recorded and so shown as `-`
+const EXPECTED_EFFORT_STDOUT: &str = r#"machine       model            records        input     uncached   cache_read  cache_write       output    reasoning        total
+machine-a     model-m1               4          350          215           63           52          156           72          506
+
+effort         records        input     uncached   cache_read  cache_write       output    reasoning        total
+-                    1           40            -           10           10           20            -           60
+medium               1           10            5            3            2            6            2           16
+xhigh                2          300          210           50           40          130           70          430
+- = not recorded in any record; totals sum only recorded values
+coverage: accepted=4 metered=4 unmetered=0 (100.0%)
 "#;
 
 fn run_summary(config_path: &Path) -> (ExitStatus, String, String) {
@@ -224,6 +352,25 @@ fn summary_prints_independently_calculated_grouped_totals() {
         "null-usage records contribute nothing"
     );
     assert!(!stdout.contains('$'), "no prices are invented");
+}
+
+/// The summary groups token totals by the declared effort and keeps the
+/// no-effort remainder in an explicit unlabelled row (issue #36). The literal
+/// expectation is independently hand-calculated in [`EXPECTED_EFFORT_STDOUT`].
+#[test]
+fn summary_groups_token_totals_by_declared_effort_with_unlabelled_remainder() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let usage_file = dir.path().join("usage.jsonl");
+    std::fs::write(&usage_file, effort_fixture()).expect("write synthetic usage file");
+    let config_path = write_config(&dir, &usage_file);
+
+    let (status, stdout, stderr) = run_summary(&config_path);
+    assert!(status.success(), "summary exits zero, stderr: {stderr}");
+    assert_eq!(stdout, EXPECTED_EFFORT_STDOUT);
+    assert!(
+        !stdout.contains('$'),
+        "the effort breakdown computes no prices"
+    );
 }
 
 #[test]

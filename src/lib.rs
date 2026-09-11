@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
@@ -16,7 +17,7 @@ pub mod config;
 pub mod summary;
 mod usage;
 
-use usage::{AccountingQuality, AuditRecord, Operation, Outcome, StreamUsageParser};
+use usage::{AccountingQuality, AuditRecord, Operation, Outcome, RequestEffort, StreamUsageParser};
 
 #[cfg(all(not(test), target_os = "linux"))]
 #[global_allocator]
@@ -225,6 +226,12 @@ async fn route_v1(gateway: Gateway, req: Request<Body>) -> Response {
         _ => None,
     };
     let meter = operation.is_some();
+    // The metered Responses paths mirror the forwarded request body to observe
+    // the single declared-effort fact (issue #36). The body is still forwarded
+    // chunk-by-chunk unchanged, so opaque request streaming is preserved and
+    // nothing waits for the body to finish before the upstream is contacted.
+    let declared_effort: Option<Arc<StdMutex<RequestEffort>>> =
+        meter.then(|| Arc::new(StdMutex::new(RequestEffort::default())));
 
     // Build the upstream URL from the fixed base plus the caller's relative
     // path below `/v1`, preserving the caller's raw (including percent-encoded
@@ -287,10 +294,10 @@ async fn route_v1(gateway: Gateway, req: Request<Body>) -> Response {
         builder = builder.header(name, value);
     }
 
+    let request_body =
+        RequestMirrorStream::new(req.into_body().into_data_stream(), declared_effort.clone());
     match builder
-        .body(reqwest::Body::wrap_stream(
-            req.into_body().into_data_stream(),
-        ))
+        .body(reqwest::Body::wrap_stream(request_body))
         .send()
         .await
     {
@@ -340,6 +347,7 @@ async fn route_v1(gateway: Gateway, req: Request<Body>) -> Response {
                 .get("openai-model")
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
+            let effort_observer = declared_effort.clone();
             tokio::spawn(async move {
                 // For the metered Responses paths the observer is independent
                 // of the upstream Content-Type: the Codex Responses client feeds
@@ -399,6 +407,16 @@ async fn route_v1(gateway: Gateway, req: Request<Body>) -> Response {
                 // lifecycle-logged via tracing without inventing usage.
                 if let (Some(parser), Some(operation)) = (&mut parser, operation) {
                     parser.finalize().await;
+                    // Read the mirrored request fact at finalization: in the
+                    // normal accepted flow the request body completes before
+                    // the terminal response, so the mirror is parsed once here
+                    // and the declared effort is attached to whichever terminal
+                    // record this lifecycle produces (issue #36).
+                    let reasoning_effort = effort_observer.as_ref().and_then(|observer| {
+                        let mut observer = observer.lock().unwrap();
+                        observer.finish();
+                        observer.effort()
+                    });
                     record_audit(
                         &audit,
                         &machine_id,
@@ -407,6 +425,7 @@ async fn route_v1(gateway: Gateway, req: Request<Body>) -> Response {
                         is_success,
                         outcome,
                         parser,
+                        reasoning_effort,
                     );
                 }
             });
@@ -427,6 +446,15 @@ async fn route_v1(gateway: Gateway, req: Request<Body>) -> Response {
                 let mut record = AuditRecord::new(machine_id.to_string(), operation);
                 record.upstream_status = None;
                 record.outcome = Outcome::TransportError;
+                // The declared effort is attached whenever the request body was
+                // fully mirrored before the transport failed; a body the
+                // connection failed before reading is unobserved and carries no
+                // effort (issue #36).
+                record.reasoning_effort = declared_effort.as_ref().and_then(|observer| {
+                    let mut observer = observer.lock().unwrap();
+                    observer.finish();
+                    observer.effort()
+                });
                 gateway.audit.try_record(record);
             }
             tracing::error!(
@@ -445,6 +473,7 @@ async fn route_v1(gateway: Gateway, req: Request<Body>) -> Response {
 /// state (DESIGN.md §5 scenario mapping). Non-2xx responses record
 /// `upstream_error` and never meter usage; for 2xx responses the observer
 /// supplies model/usage/quality or an explicit metering error.
+#[allow(clippy::too_many_arguments)]
 fn record_audit(
     audit: &usage::AuditWriter,
     machine_id: &str,
@@ -453,9 +482,11 @@ fn record_audit(
     is_success: bool,
     outcome: Outcome,
     parser: &StreamUsageParser,
+    reasoning_effort: Option<String>,
 ) {
     let mut record = AuditRecord::new(machine_id.to_string(), operation);
     record.upstream_status = Some(upstream_status);
+    record.reasoning_effort = reasoning_effort;
     record.outcome = if !is_success {
         Outcome::UpstreamError
     } else if outcome == Outcome::Completed && parser.incomplete() {
@@ -490,6 +521,58 @@ fn record_audit(
         record.metering_error = None;
     }
     audit.try_record(record);
+}
+
+/// Mirrors a forwarded request body for the single declared reasoning-effort
+/// fact (issue #36) while leaving every chunk byte-for-byte unchanged and
+/// preserving incremental streaming: a chunk is observed and handed on without
+/// waiting for the rest of the body. Mirroring happens only when an observer is
+/// supplied (the metered Responses paths); the mirror is parsed exactly once by
+/// [`usage::RequestEffort`] — at audit finalization, or at clean EOF when the
+/// HTTP stack polls that far — and is never retained here.
+struct RequestMirrorStream<S> {
+    inner: S,
+    effort: Option<Arc<StdMutex<RequestEffort>>>,
+}
+
+impl<S> RequestMirrorStream<S> {
+    fn new(inner: S, effort: Option<Arc<StdMutex<RequestEffort>>>) -> Self {
+        RequestMirrorStream { inner, effort }
+    }
+}
+
+impl<S, E> Stream for RequestMirrorStream<S>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+{
+    type Item = Result<Bytes, E>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let effort = self.effort.clone();
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                if let Some(effort) = &effort {
+                    effort.lock().unwrap().observe(&bytes);
+                }
+                std::task::Poll::Ready(Some(Ok(bytes)))
+            }
+            std::task::Poll::Ready(Some(Err(err))) => std::task::Poll::Ready(Some(Err(err))),
+            std::task::Poll::Ready(None) => {
+                if let Some(effort) = &effort {
+                    effort.lock().unwrap().finish();
+                }
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
 }
 
 /// Fires `notify` once when the wrapped stream is dropped — i.e. when the

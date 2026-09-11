@@ -529,6 +529,149 @@ async fn accepted_streaming_response_is_forwarded_unchanged_and_records_known_us
     }
 }
 
+/// A real Codex `/v1/responses` request declares its reasoning effort inside the
+/// JSON body (`reasoning.effort`, verified against the installed client); the
+/// canonical record copies that value verbatim, while the request body stays
+/// forwarded byte-for-byte and the token facts are unchanged (issue #36).
+#[tokio::test]
+async fn accepted_request_declared_reasoning_effort_is_recorded_verbatim() {
+    const REQUEST_WITH_EFFORT: &str = "{\"model\":\"synthetic-model-001\",\"input\":\"synthetic-input-01\",\"reasoning\":{\"effort\":\"xhigh\"}}";
+
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![("content-type".to_string(), "text/event-stream".to_string())],
+        body: STREAMING_RESPONSE_FIXTURE.as_bytes().to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body(REQUEST_WITH_EFFORT)
+        .send()
+        .await
+        .expect("caller reaches gateway");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.bytes().await.expect("gateway response body");
+
+    let captured = upstream
+        .captured
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("fake upstream received the request");
+    assert_eq!(
+        captured.body,
+        REQUEST_WITH_EFFORT.as_bytes(),
+        "the request body is forwarded byte-for-byte"
+    );
+
+    let record = wait_for_jsonl_record(&usage_file).await;
+    assert_eq!(record["operation"], "response");
+    assert_eq!(
+        record["reasoning_effort"], "xhigh",
+        "the declared effort is copied verbatim into the canonical record"
+    );
+    // Annotation only: token facts and accounting quality are unchanged.
+    let usage = &record["usage"];
+    assert_eq!(usage["input_total"], 12);
+    assert_eq!(usage["uncached"], 6);
+    assert_eq!(usage["cache_read"], 4);
+    assert_eq!(usage["cache_write"], 2);
+    assert_eq!(usage["output_total"], 5);
+    assert_eq!(usage["reasoning"], 2);
+    assert_eq!(usage["total"], 17);
+    assert_eq!(record["accounting_quality"], "complete");
+}
+
+/// A request that declares no reasoning effort carries an explicit `null` in
+/// the canonical record — no invented default — and is still forwarded and
+/// metered exactly as before (issue #36).
+#[tokio::test]
+async fn accepted_request_without_declared_effort_records_absent_and_meters_unchanged() {
+    const REQUEST_WITHOUT_EFFORT: &str =
+        "{\"model\":\"synthetic-model-001\",\"input\":\"synthetic-input-01\"}";
+
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![("content-type".to_string(), "text/event-stream".to_string())],
+        body: STREAMING_RESPONSE_FIXTURE.as_bytes().to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .body(REQUEST_WITHOUT_EFFORT)
+        .send()
+        .await
+        .expect("caller reaches gateway");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.bytes().await.expect("gateway response body");
+
+    let captured = upstream
+        .captured
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("fake upstream received the request");
+    assert_eq!(
+        captured.body,
+        REQUEST_WITHOUT_EFFORT.as_bytes(),
+        "the request body is forwarded byte-for-byte"
+    );
+
+    let record = wait_for_jsonl_record(&usage_file).await;
+    assert!(
+        record.get("reasoning_effort").is_some(),
+        "the record carries the annotation field"
+    );
+    assert!(
+        record["reasoning_effort"].is_null(),
+        "no effort is invented when the request declares none"
+    );
+    assert_eq!(record["accounting_quality"], "complete");
+    let usage = &record["usage"];
+    assert_eq!(usage["input_total"], 12);
+    assert_eq!(usage["uncached"], 6);
+    assert_eq!(usage["output_total"], 5);
+    assert_eq!(usage["total"], 17);
+}
+
 /// A synthetic Responses SSE terminal event under a body labeled
 /// `application/json` (issue #20): the real Codex Responses client feeds the
 /// response byte stream to its SSE parser regardless of the upstream

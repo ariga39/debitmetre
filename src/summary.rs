@@ -22,6 +22,11 @@ use crate::usage::{AuditRecord, Usage, KIND, SCHEMA_VERSION};
 /// never invented.
 type GroupKey = (String, Option<String>);
 
+/// Aggregation key for the declared-effort breakdown (issue #36): the verbatim
+/// `reasoning.effort` string, or `None` for records that declared no effort
+/// (kept as an explicit unlabelled row rather than folded into a default).
+type EffortKey = Option<String>;
+
 /// Accumulated token counters for one (machine, model) group. Each sum covers
 /// only the values actually recorded: a counter never present in the group
 /// stays missing and renders as `-`, never as an invented 0.
@@ -76,19 +81,30 @@ impl Coverage {
 /// Read the usage file and print the grouped summary to `out`. Warnings (a
 /// skipped unfinished trailing line, unparseable records) go to stderr.
 pub fn print_summary(path: &Path, out: &mut dyn Write) -> Result<(), String> {
-    let (groups, coverage, warnings) = read_usage_file(path)?;
-    render(out, &groups, &coverage).map_err(|err| format!("cannot write summary: {err}"))?;
+    let (groups, effort_groups, coverage, warnings) = read_usage_file(path)?;
+    render(out, &groups, &effort_groups, &coverage)
+        .map_err(|err| format!("cannot write summary: {err}"))?;
     print_warnings(&warnings);
     Ok(())
 }
 
+#[allow(clippy::type_complexity)]
 fn read_usage_file(
     path: &Path,
-) -> Result<(BTreeMap<GroupKey, GroupTotals>, Coverage, ReadWarnings), String> {
+) -> Result<
+    (
+        BTreeMap<GroupKey, GroupTotals>,
+        BTreeMap<EffortKey, GroupTotals>,
+        Coverage,
+        ReadWarnings,
+    ),
+    String,
+> {
     let file = std::fs::File::open(path)
         .map_err(|err| format!("cannot read usage file {}: {err}", path.display()))?;
     let mut reader = io::BufReader::new(file);
     let mut groups: BTreeMap<GroupKey, GroupTotals> = BTreeMap::new();
+    let mut effort_groups: BTreeMap<EffortKey, GroupTotals> = BTreeMap::new();
     let mut coverage = Coverage::default();
     let mut warnings = ReadWarnings::default();
     let mut line: Vec<u8> = Vec::new();
@@ -123,6 +139,13 @@ fn read_usage_file(
                 if let Some(usage) = record.usage {
                     let key = (record.machine_id, record.model);
                     accumulate_usage(groups.entry(key).or_default(), &usage);
+                    // The declared-effort breakdown is an orthogonal view over
+                    // the same token facts (issue #36): a record that declared
+                    // no effort stays in the explicit `None` (unlabelled) row.
+                    accumulate_usage(
+                        effort_groups.entry(record.reasoning_effort).or_default(),
+                        &usage,
+                    );
                 }
             }
             Ok(_) => {}
@@ -142,7 +165,7 @@ fn read_usage_file(
             break;
         }
     }
-    Ok((groups, coverage, warnings))
+    Ok((groups, effort_groups, coverage, warnings))
 }
 
 fn accumulate_usage(totals: &mut GroupTotals, usage: &Usage) {
@@ -170,6 +193,7 @@ const COUNTER_W: usize = 12;
 fn render(
     out: &mut dyn Write,
     groups: &BTreeMap<GroupKey, GroupTotals>,
+    effort_groups: &BTreeMap<EffortKey, GroupTotals>,
     coverage: &Coverage,
 ) -> io::Result<()> {
     writeln!(
@@ -191,6 +215,39 @@ fn render(
             out,
             "{machine:<MACHINE_W$}{:<MODEL_W$}{:>RECORDS_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$}",
             model.as_deref().unwrap_or("-"),
+            totals.records,
+            cell(totals.input_total),
+            cell(totals.uncached),
+            cell(totals.cache_read),
+            cell(totals.cache_write),
+            cell(totals.output_total),
+            cell(totals.reasoning),
+            cell(totals.total),
+        )?;
+    }
+    // Declared-effort breakdown (issue #36): token totals grouped by the
+    // verbatim `reasoning.effort` the request declared, with the no-effort
+    // remainder shown as an explicit unlabelled `-` row. This is an annotation
+    // view over the same facts; it never changes metering or attribution.
+    writeln!(out)?;
+    writeln!(
+        out,
+        "{:<MACHINE_W$}{:>RECORDS_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$}",
+        "effort",
+        "records",
+        "input",
+        "uncached",
+        "cache_read",
+        "cache_write",
+        "output",
+        "reasoning",
+        "total",
+    )?;
+    for (effort, totals) in effort_groups {
+        writeln!(
+            out,
+            "{:<MACHINE_W$}{:>RECORDS_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$} {:>COUNTER_W$}",
+            effort.as_deref().unwrap_or("-"),
             totals.records,
             cell(totals.input_total),
             cell(totals.uncached),

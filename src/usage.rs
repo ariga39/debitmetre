@@ -125,6 +125,12 @@ pub(crate) struct AuditRecord {
     pub(crate) model: Option<String>,
     pub(crate) accounting_quality: AccountingQuality,
     pub(crate) metering_error: Option<MeteringError>,
+    /// The reasoning effort the caller declared in the request body verbatim
+    /// (`reasoning.effort`), if it declared one (issue #36). Absent stays `null`;
+    /// the gateway never invents or default-fills an effort. `#[serde(default)]`
+    /// keeps records written before this field readable.
+    #[serde(default)]
+    pub(crate) reasoning_effort: Option<String>,
     pub(crate) usage: Option<Usage>,
 }
 
@@ -145,9 +151,71 @@ impl AuditRecord {
             model: None,
             accounting_quality: AccountingQuality::Unavailable,
             metering_error: None,
+            reasoning_effort: None,
             usage: None,
         }
     }
+}
+
+/// Shared observation of the caller's request body for the single declared
+/// reasoning-effort fact (issue #36). A streaming observer mirrors the forwarded
+/// request bytes without changing them; the mirror is parsed exactly once when
+/// the lifecycle finalizes, and only the verbatim `reasoning.effort` string
+/// leaves this observer. The mirror is released on parse.
+///
+/// The gateway does not decompress request bodies. A compressed or otherwise
+/// non-JSON body is therefore *unobserved*: the declared effort cannot be read
+/// and is recorded absent, exactly as a body that never declared one. This is an
+/// explicit limitation, not a claim that such a body declares no effort.
+#[derive(Default)]
+pub(crate) struct RequestEffort {
+    mirror: Vec<u8>,
+    effort: Option<String>,
+    parsed: bool,
+}
+
+impl RequestEffort {
+    /// Mirror one forwarded request chunk; the caller's bytes are untouched.
+    /// Each byte is retained once and the whole mirror is parsed a single time
+    /// by [`RequestEffort::finish`]; there is no per-chunk reparse.
+    pub(crate) fn observe(&mut self, chunk: &[u8]) {
+        if self.parsed {
+            return;
+        }
+        self.mirror.extend_from_slice(chunk);
+    }
+
+    /// Parse the mirror exactly once. Called when the audit lifecycle finalizes
+    /// (the normal accepted flow completes the request body before the terminal
+    /// response) and again on clean request-body EOF when the HTTP stack polls
+    /// that far; later calls are no-ops.
+    pub(crate) fn finish(&mut self) {
+        if self.parsed {
+            return;
+        }
+        self.parsed = true;
+        self.effort = serde_json::from_slice::<serde_json::Value>(&self.mirror)
+            .ok()
+            .and_then(|root| declared_effort_in(&root));
+        self.mirror = Vec::new();
+    }
+
+    /// The declared effort copied verbatim, if the body parsed as JSON and
+    /// declared one; `None` when the fact was not observed (no declaration, or
+    /// a body the gateway does not decode).
+    pub(crate) fn effort(&self) -> Option<String> {
+        self.effort.clone()
+    }
+}
+
+/// Copy `reasoning.effort` verbatim from a parsed JSON request body. A missing
+/// path or a non-string value yields None: the gateway records only what the
+/// caller declared.
+fn declared_effort_in(root: &serde_json::Value) -> Option<String> {
+    root.get("reasoning")?
+        .get("effort")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// Result of extracting usage from a completed stream.

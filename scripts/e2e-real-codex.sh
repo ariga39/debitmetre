@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Real-Codex loopback self-test (issues #5, #29, #31).
+# Real-Codex loopback self-test (issues #5, #29, #31, #36).
 #
 # Opt-in system acceptance: starts the current debitmetre binary on a loopback
 # port, points the operator's existing authenticated codex CLI at it through a
@@ -10,9 +10,11 @@
 # command fails before Codex runs, runs the explicit installed `gpt-5.6-luna`
 # model, and proves the same acceptance command passes afterward after any
 # protected-file edits are discarded (the task README, fixture, and acceptance
-# test cannot influence the result). It reports
+# test cannot influence the result). It explicitly declares a reasoning effort
+# to the client and reads the recorded value back from the audit file (issue
+# #36). It reports
 # only sanitized pass/fail evidence for task success, canonical usage, model
-# attribution, per-model summary, and diagnostic logs. It also explicitly
+# attribution, declared reasoning effort, per-model summary, and diagnostic logs. It also explicitly
 # proves (from sanitized method/route/status lifecycle-log evidence) that the
 # Codex model-discovery `GET /v1/models` request was accepted and received a
 # 2xx upstream response, so a non-fatal local or upstream 404 cannot be silently
@@ -75,6 +77,10 @@ done
 # --- parameters ------------------------------------------------------------
 PORT="${DEBITMETRE_E2E_PORT:-18787}"
 TIMEOUT="${DEBITMETRE_E2E_TIMEOUT:-600}"
+# The reasoning effort this run explicitly declares to the Codex client; the
+# audit readback below proves the gateway recorded exactly this value verbatim
+# (issue #36). Synthetic and public.
+DECLARED_EFFORT="xhigh"
 
 # --- validate parameters before any traffic --------------------------------
 # Reject invalid values (including 0, negatives, fractions, and option-like
@@ -228,6 +234,7 @@ MARKER="DEBITMETRE-E2E-TASK-BODY-MARKER"
 PROMPT="$MARKER Inspect the failing order-report project, run 'python3 test_report.py' to see it fail, then repair it so that the check passes. Do not modify README.md, the files under data/, or test_report.py; fix only the source modules under src/."
 CODEX_EXIT=0
 if timeout "$TIMEOUT" codex exec -m gpt-5.6-luna -C "$WORKDIR/task-repo" \
+    -c "model_reasoning_effort=\"$DECLARED_EFFORT\"" \
     -c 'model_providers.debitmetre.name="debitmetre"' \
     -c "model_providers.debitmetre.base_url=\"http://127.0.0.1:$PORT/v1\"" \
     -c 'model_providers.debitmetre.wire_api="responses"' \
@@ -283,7 +290,8 @@ if ! jq -e --slurp '
         (. | keys | sort) == [
             "accounting_quality", "event_id", "kind", "machine_id",
             "metering_error", "model", "operation", "outcome",
-            "schema_version", "timestamp", "upstream_status", "usage"
+            "reasoning_effort", "schema_version", "timestamp",
+            "upstream_status", "usage"
         ]
         and (.schema_version == 1)
         and (.kind == "request")
@@ -311,6 +319,21 @@ if ! jq -e --slurp '
     )' "$WORKDIR/usage.jsonl" >/dev/null 2>&1
 then
     die validate "no canonical schema_version=1 request record with the seven canonical usage counters, a non-null model, and integral nonnegative nonzero usage"
+fi
+
+# --- declared reasoning effort is read back from the audit ------------------
+# The run explicitly declared `model_reasoning_effort=$DECLARED_EFFORT`; the
+# canonical audit must contain at least one request record carrying exactly that
+# value. This is a readback of the stored fact, proven only by the recorded
+# value, never by echoing prompts, bodies, credentials, or model names.
+if ! jq -e --arg effort "$DECLARED_EFFORT" --slurp '
+    any(.[];
+        .schema_version == 1
+        and .kind == "request"
+        and .reasoning_effort == $effort)
+    ' "$WORKDIR/usage.jsonl" >/dev/null 2>&1
+then
+    die effort "no canonical request record carries the declared reasoning effort (audit readback)"
 fi
 
 # --- debitmetre summary corresponds to the canonical audit records ---------
@@ -463,6 +486,7 @@ fi
 RECORDS="$(jq --slurp 'length' "$WORKDIR/usage.jsonl")"
 echo "debitmetre e2e: PASS task: independent order-report test passed after the gpt-5.6-luna repair"
 echo "debitmetre e2e: PASS audit: canonical schema_version=1 request record with required lifecycle fields, exactly seven usage counters, non-null model, and integral nonnegative nonzero usage"
+echo "debitmetre e2e: PASS effort: canonical audit record carries the declared reasoning effort (verified by audit readback)"
 echo "debitmetre e2e: PASS summary: per-model summary groups match the accepted canonical audit records with nonzero totals"
 echo "debitmetre e2e: PASS models: GET /v1/models accepted with a 2xx upstream response (sanitized method/route/status evidence)"
 echo "debitmetre e2e: PASS logs: accepted/upstream lifecycle events; no raw meter key or task body marker"
@@ -471,3 +495,4 @@ echo "debitmetre e2e: PASS protected: task README, fixture, and acceptance test 
 echo "debitmetre e2e: evidence: codex_exit=$CODEX_EXIT records=$RECORDS port=$PORT"
 echo "debitmetre e2e: evidence: summary_rows=$SUMMARY_ROWS has_nonzero=1"
 echo "debitmetre e2e: evidence: model_discovery=accepted_2xx"
+echo "debitmetre e2e: evidence: declared_effort_verified=1"
