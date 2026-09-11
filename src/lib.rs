@@ -537,8 +537,8 @@ fn record_audit(
 /// waiting for the rest of the body. Mirroring happens only when an observer is
 /// supplied (the metered Responses paths); the mirror is decoded (per the
 /// forwarded `Content-Encoding`) and parsed exactly once by
-/// [`usage::RequestEffort`] — at audit finalization, or at clean EOF when the
-/// HTTP stack polls that far — and is never retained here.
+/// [`usage::RequestEffort`] when the audit lifecycle finalizes, never on the
+/// forwarding path, and is not retained here after that.
 struct RequestMirrorStream<S> {
     inner: S,
     effort: Option<Arc<StdMutex<RequestEffort>>>,
@@ -569,12 +569,13 @@ where
                 std::task::Poll::Ready(Some(Ok(bytes)))
             }
             std::task::Poll::Ready(Some(Err(err))) => std::task::Poll::Ready(Some(Err(err))),
-            std::task::Poll::Ready(None) => {
-                if let Some(effort) = &effort {
-                    effort.lock().unwrap().finish();
-                }
-                std::task::Poll::Ready(None)
-            }
+            // Request EOF is forwarded immediately: no decode or parse runs on
+            // the forwarding path. The mirrored fact is extracted only when the
+            // audit lifecycle finalizes, after the caller's bytes are already
+            // delivered (issue #36 review). This also matches a request body
+            // with a known Content-Length, which the HTTP stack need not poll to
+            // EOF at all.
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
             std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }

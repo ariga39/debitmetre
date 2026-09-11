@@ -201,11 +201,11 @@ impl RequestEffort {
         self.mirror.extend_from_slice(chunk);
     }
 
-    /// Decode and parse the mirror exactly once. Called when the audit lifecycle
-    /// finalizes (the normal accepted flow completes the request body before the
-    /// terminal response) and again on clean request-body EOF when the HTTP
-    /// stack polls that far; later calls are no-ops. A partial mirror from an
-    /// early failure/cancel simply fails to decode/parse and records no effort.
+    /// Decode and parse the mirror exactly once at audit finalization (the
+    /// normal accepted flow completes the request body before the terminal
+    /// response); later calls are no-ops. It never runs on the forwarding path,
+    /// so request EOF is not delayed. A partial mirror from an early
+    /// failure/cancel simply fails to decode/parse and records no effort.
     pub(crate) fn finish(&mut self) {
         if self.parsed {
             return;
