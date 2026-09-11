@@ -162,7 +162,8 @@ impl AuditRecord {
 /// request bytes without changing them; once the lifecycle finalizes the mirror
 /// is decoded (when the request declared a supported `Content-Encoding`) and
 /// parsed exactly once, and only the verbatim `reasoning.effort` string leaves
-/// this observer. The mirror and decoded buffer are released on parse.
+/// this observer. The mirror is released on parse, and a compressed body is
+/// streamed through the decoder so no full decompressed copy is materialized.
 ///
 /// Forwarding is never affected: the original compressed bytes and the
 /// `Content-Encoding` header are forwarded unchanged, and decoding happens only
@@ -211,8 +212,7 @@ impl RequestEffort {
         }
         self.parsed = true;
         let mirror = std::mem::take(&mut self.mirror);
-        self.effort = decode_request_body(&mirror, self.encoding.as_deref())
-            .and_then(|body| declared_effort_in(&body));
+        self.effort = declared_effort_from(&mirror, self.encoding.as_deref());
     }
 
     /// The declared effort copied verbatim, if the decoded body parsed as JSON
@@ -249,23 +249,6 @@ fn encoding_kind(encoding: Option<&str>) -> EncodingKind {
     }
 }
 
-/// Decode the observer's private copy of the request body according to the
-/// forwarded `Content-Encoding`. The original forwarded bytes are never
-/// touched. Decoding uses the established `zstd` decoder; no codec is
-/// hand-rolled.
-fn decode_request_body<'a>(
-    raw: &'a [u8],
-    encoding: Option<&str>,
-) -> Option<std::borrow::Cow<'a, [u8]>> {
-    match encoding_kind(encoding) {
-        EncodingKind::Identity => Some(std::borrow::Cow::Borrowed(raw)),
-        EncodingKind::Zstd => zstd::stream::decode_all(raw)
-            .ok()
-            .map(std::borrow::Cow::Owned),
-        EncodingKind::Unsupported => None,
-    }
-}
-
 /// The minimal shape needed to read the declared effort. Serde ignores every
 /// other field, so the whole request body is never retained as a JSON value.
 #[derive(Deserialize)]
@@ -278,11 +261,20 @@ struct DeclaredReasoningDetail {
     effort: Option<String>,
 }
 
-/// Copy `reasoning.effort` verbatim from a decoded JSON request body. A missing
-/// path or a non-string value yields None: the gateway records only what the
-/// caller declared.
-fn declared_effort_in(body: &[u8]) -> Option<String> {
-    let declared: DeclaredReasoning = serde_json::from_slice(body).ok()?;
+/// Read the declared effort from the observer's private mirror according to the
+/// forwarded `Content-Encoding`; the original forwarded bytes are never touched.
+/// For none/`identity` the bytes are parsed in place. For `zstd` the established
+/// decoder is streamed straight into serde, so the full decompressed prompt is
+/// never materialized as a buffer. Any other or layered encoding is unobserved.
+fn declared_effort_from(raw: &[u8], encoding: Option<&str>) -> Option<String> {
+    let declared: DeclaredReasoning = match encoding_kind(encoding) {
+        EncodingKind::Identity => serde_json::from_slice(raw).ok()?,
+        EncodingKind::Zstd => {
+            let decoder = zstd::stream::read::Decoder::new(raw).ok()?;
+            serde_json::from_reader(decoder).ok()?
+        }
+        EncodingKind::Unsupported => return None,
+    };
     declared.reasoning?.effort
 }
 
