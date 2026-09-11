@@ -76,7 +76,8 @@ Request headers follow an explicit stripping policy that prioritizes compatibili
 ## 4. Metering and token accounting
 
 - The request body is forwarded directly as an opaque stream: no decompression, no transformation, no caching. The sole exception is a transient mirror used to read the one declared-effort annotation below; the forwarded bytes are unchanged and streaming is not buffered.
-- The caller-declared reasoning effort (Responses request field `reasoning.effort`) is recorded verbatim in the request's canonical record (issue #36). It is an annotation on the token facts only: it must not change metering, lifecycle classification, `accounting_quality`, streaming, forwarding, or any existing counter. The observer mirrors the forwarded request bytes while they stream and parses the mirror exactly once at lifecycle finalization; only the effort string is retained, never prompt, completion, or body content. When no effort is declared, or when the body is not a JSON document the gateway decodes (for example a compressed request body, which the gateway does not decompress), the fact is **unobserved** and recorded `null` — it is never invented, default-filled, or inferred from a model default. The supported flow (the documented custom-provider setup, which sends an identity-encoded JSON body) is what the real E2E exercises; compressed request bodies are outside the observation scope of this slice.
+- The caller-declared reasoning effort (Responses request field `reasoning.effort`) is recorded verbatim in the request's canonical record (issue #36). It is an annotation on the token facts only: it must not change metering, lifecycle classification, `accounting_quality`, streaming, forwarding, or any existing counter. The observer mirrors the forwarded request bytes while they stream, decodes a private copy according to the request's `Content-Encoding`, and parses it exactly once at lifecycle finalization; only the effort string is retained, never prompt, completion, or body content. Forwarding is untouched: the original bytes and the `Content-Encoding` header are passed upstream unchanged.
+- Effort observation supports the encodings the supported flows actually use: none/`identity` (the documented custom-provider setup, and the real E2E) and `zstd` (which the Codex Responses client enables for its own backend). Any other or layered encoding is **unobserved** and recorded `null` rather than guessed at. A body that is genuinely not received — an early upstream failure or a cancellation that ends the lifecycle before the request body completes — is likewise unobserved and recorded `null`; the gateway never delays or prereads the forwarded stream to recover bytes it did not receive. `null` is never an invented, default-filled, or model-inferred effort.
 - `model` is the valid `openai-model` response header when present (the pinned Codex client reports it as its server model); the terminal-body `model` is only the fallback. If neither is available, record null, which does not affect forwarding.
 - Input tokens use a mutually exclusive accounting basis:
 
@@ -250,7 +251,10 @@ real captures must not be committed; only minimal, de-identified, synthetic SSE/
 
 The following issues do not block specification or test writing, but they do block confirmation of production usability:
 
-- [ ] Content-encoding distribution of real Codex requests.
+- [x] Content-encoding distribution of real Codex requests. The documented custom-provider flow sends an
+  identity-encoded JSON body (confirmed by the real E2E); the Codex Responses client enables `zstd` only for
+  its own OpenAI backend. Both are observed by the declared-effort observer (§4); other encodings are out of
+  scope and recorded unobserved.
 - [ ] Whether the `openai-model` response header reliably accompanies real Codex responses (header-primary model attribution depends on it).
 - [ ] Whether the `response.done` event actually exists (determines whether it is included for compatibility).
 - [ ] Confirmation of the real response shape of the compact route.

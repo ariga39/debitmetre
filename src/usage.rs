@@ -159,25 +159,40 @@ impl AuditRecord {
 
 /// Shared observation of the caller's request body for the single declared
 /// reasoning-effort fact (issue #36). A streaming observer mirrors the forwarded
-/// request bytes without changing them; the mirror is parsed exactly once when
-/// the lifecycle finalizes, and only the verbatim `reasoning.effort` string
-/// leaves this observer. The mirror is released on parse.
+/// request bytes without changing them; once the lifecycle finalizes the mirror
+/// is decoded (when the request declared a supported `Content-Encoding`) and
+/// parsed exactly once, and only the verbatim `reasoning.effort` string leaves
+/// this observer. The mirror and decoded buffer are released on parse.
 ///
-/// The gateway does not decompress request bodies. A compressed or otherwise
-/// non-JSON body is therefore *unobserved*: the declared effort cannot be read
-/// and is recorded absent, exactly as a body that never declared one. This is an
-/// explicit limitation, not a claim that such a body declares no effort.
-#[derive(Default)]
+/// Forwarding is never affected: the original compressed bytes and the
+/// `Content-Encoding` header are forwarded unchanged, and decoding happens only
+/// on the observer's private copy. Supported observation encodings are
+/// `identity`/none and `zstd` (the encoding the Codex client enables for
+/// Responses requests); any other or layered encoding is *unobserved* — the
+/// effort cannot be read and is recorded absent, never invented. A request body
+/// that is genuinely not received (early failure or cancellation) is likewise
+/// unobserved, by design: the gateway never delays or prereads the forwarded
+/// stream to recover bytes it did not receive.
 pub(crate) struct RequestEffort {
+    encoding: Option<String>,
     mirror: Vec<u8>,
     effort: Option<String>,
     parsed: bool,
 }
 
 impl RequestEffort {
+    pub(crate) fn new(encoding: Option<String>) -> Self {
+        RequestEffort {
+            encoding,
+            mirror: Vec::new(),
+            effort: None,
+            parsed: false,
+        }
+    }
+
     /// Mirror one forwarded request chunk; the caller's bytes are untouched.
-    /// Each byte is retained once and the whole mirror is parsed a single time
-    /// by [`RequestEffort::finish`]; there is no per-chunk reparse.
+    /// Each byte is retained once and the whole mirror is decoded and parsed a
+    /// single time by [`RequestEffort::finish`]; there is no per-chunk reparse.
     pub(crate) fn observe(&mut self, chunk: &[u8]) {
         if self.parsed {
             return;
@@ -185,37 +200,90 @@ impl RequestEffort {
         self.mirror.extend_from_slice(chunk);
     }
 
-    /// Parse the mirror exactly once. Called when the audit lifecycle finalizes
-    /// (the normal accepted flow completes the request body before the terminal
-    /// response) and again on clean request-body EOF when the HTTP stack polls
-    /// that far; later calls are no-ops.
+    /// Decode and parse the mirror exactly once. Called when the audit lifecycle
+    /// finalizes (the normal accepted flow completes the request body before the
+    /// terminal response) and again on clean request-body EOF when the HTTP
+    /// stack polls that far; later calls are no-ops. A partial mirror from an
+    /// early failure/cancel simply fails to decode/parse and records no effort.
     pub(crate) fn finish(&mut self) {
         if self.parsed {
             return;
         }
         self.parsed = true;
-        self.effort = serde_json::from_slice::<serde_json::Value>(&self.mirror)
-            .ok()
-            .and_then(|root| declared_effort_in(&root));
-        self.mirror = Vec::new();
+        let mirror = std::mem::take(&mut self.mirror);
+        self.effort = decode_request_body(&mirror, self.encoding.as_deref())
+            .and_then(|body| declared_effort_in(&body));
     }
 
-    /// The declared effort copied verbatim, if the body parsed as JSON and
-    /// declared one; `None` when the fact was not observed (no declaration, or
-    /// a body the gateway does not decode).
+    /// The declared effort copied verbatim, if the decoded body parsed as JSON
+    /// and declared one; `None` when the fact was not observed (no declaration,
+    /// or a body/encoding the gateway does not decode).
     pub(crate) fn effort(&self) -> Option<String> {
         self.effort.clone()
     }
 }
 
-/// Copy `reasoning.effort` verbatim from a parsed JSON request body. A missing
+/// The supported request-body content encodings for effort observation. `zstd`
+/// is the encoding the Codex Responses client enables; `identity`/none is the
+/// documented custom-provider flow. Anything else (or a layered encoding) is
+/// left unobserved rather than guessed at.
+enum EncodingKind {
+    Identity,
+    Zstd,
+    Unsupported,
+}
+
+fn encoding_kind(encoding: Option<&str>) -> EncodingKind {
+    let Some(value) = encoding else {
+        return EncodingKind::Identity;
+    };
+    let mut tokens = value
+        .split(',')
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| !token.is_empty());
+    match (tokens.next(), tokens.next()) {
+        (None, _) => EncodingKind::Identity,
+        (Some(token), None) if token == "identity" => EncodingKind::Identity,
+        (Some(token), None) if token == "zstd" => EncodingKind::Zstd,
+        _ => EncodingKind::Unsupported,
+    }
+}
+
+/// Decode the observer's private copy of the request body according to the
+/// forwarded `Content-Encoding`. The original forwarded bytes are never
+/// touched. Decoding uses the established `zstd` decoder; no codec is
+/// hand-rolled.
+fn decode_request_body<'a>(
+    raw: &'a [u8],
+    encoding: Option<&str>,
+) -> Option<std::borrow::Cow<'a, [u8]>> {
+    match encoding_kind(encoding) {
+        EncodingKind::Identity => Some(std::borrow::Cow::Borrowed(raw)),
+        EncodingKind::Zstd => zstd::stream::decode_all(raw)
+            .ok()
+            .map(std::borrow::Cow::Owned),
+        EncodingKind::Unsupported => None,
+    }
+}
+
+/// The minimal shape needed to read the declared effort. Serde ignores every
+/// other field, so the whole request body is never retained as a JSON value.
+#[derive(Deserialize)]
+struct DeclaredReasoning {
+    reasoning: Option<DeclaredReasoningDetail>,
+}
+
+#[derive(Deserialize)]
+struct DeclaredReasoningDetail {
+    effort: Option<String>,
+}
+
+/// Copy `reasoning.effort` verbatim from a decoded JSON request body. A missing
 /// path or a non-string value yields None: the gateway records only what the
 /// caller declared.
-fn declared_effort_in(root: &serde_json::Value) -> Option<String> {
-    root.get("reasoning")?
-        .get("effort")?
-        .as_str()
-        .map(str::to_owned)
+fn declared_effort_in(body: &[u8]) -> Option<String> {
+    let declared: DeclaredReasoning = serde_json::from_slice(body).ok()?;
+    declared.reasoning?.effort
 }
 
 /// Result of extracting usage from a completed stream.

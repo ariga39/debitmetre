@@ -672,6 +672,88 @@ async fn accepted_request_without_declared_effort_records_absent_and_meters_unch
     assert_eq!(usage["total"], 17);
 }
 
+/// A real Codex client can send the Responses request body Zstd-compressed
+/// (`Content-Encoding: zstd`). The gateway forwards the exact compressed bytes
+/// and header unchanged, while the observer-side mirror decodes a *copy* to read
+/// the declared effort (issue #36). Usage and accounting quality are unchanged.
+#[tokio::test]
+async fn accepted_zstd_request_records_declared_effort_while_forwarding_compressed_bytes() {
+    const REQUEST_JSON: &str = "{\"model\":\"synthetic-model-001\",\"input\":\"synthetic-input-01\",\"reasoning\":{\"effort\":\"xhigh\"}}";
+    let compressed = zstd::stream::encode_all(REQUEST_JSON.as_bytes(), 3)
+        .expect("zstd-encode the synthetic request body");
+
+    let upstream = FakeUpstream::default();
+    let fake_app = Router::new()
+        .route("/responses", post(canned_upstream_handler))
+        .with_state(upstream.clone());
+    let upstream_url = spawn(fake_app).await;
+
+    upstream.queue.lock().unwrap().push(CannedResponse {
+        status: StatusCode::OK,
+        headers: vec![("content-type".to_string(), "text/event-stream".to_string())],
+        body: STREAMING_RESPONSE_FIXTURE.as_bytes().to_vec(),
+    });
+
+    let usage_dir = tempfile::TempDir::new().unwrap();
+    let usage_file = usage_dir.path().join("usage.jsonl");
+    let machine_keys =
+        BTreeMap::from([(TEST_METER_KEY_DIGEST.to_string(), String::from("machine-a"))]);
+    let gateway = Gateway::for_tests(
+        reqwest::Url::parse(&upstream_url).expect("fake upstream url"),
+        machine_keys,
+        &usage_file,
+    );
+    let gateway_url = spawn(gateway.router()).await;
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{gateway_url}/v1/responses"))
+        .header("x-meter-key", "test-meter-key-machine-a")
+        .header("content-encoding", "zstd")
+        .body(compressed.clone())
+        .send()
+        .await
+        .expect("caller reaches gateway");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.bytes().await.expect("gateway response body");
+
+    let captured = upstream
+        .captured
+        .lock()
+        .unwrap()
+        .pop()
+        .expect("fake upstream received the request");
+    assert_eq!(
+        captured.body, compressed,
+        "the compressed request bytes are forwarded byte-for-byte"
+    );
+    assert_eq!(
+        captured
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-encoding"))
+            .map(|(_, value)| value.as_str()),
+        Some("zstd"),
+        "the Content-Encoding header is forwarded unchanged"
+    );
+
+    let record = wait_for_jsonl_record(&usage_file).await;
+    assert_eq!(
+        record["reasoning_effort"], "xhigh",
+        "the declared effort is read from the decoded observer-side copy"
+    );
+    // Annotation only: the token facts and accounting quality are unchanged.
+    assert_eq!(record["accounting_quality"], "complete");
+    let usage = &record["usage"];
+    assert_eq!(usage["input_total"], 12);
+    assert_eq!(usage["uncached"], 6);
+    assert_eq!(usage["cache_read"], 4);
+    assert_eq!(usage["cache_write"], 2);
+    assert_eq!(usage["output_total"], 5);
+    assert_eq!(usage["reasoning"], 2);
+    assert_eq!(usage["total"], 17);
+}
+
 /// A synthetic Responses SSE terminal event under a body labeled
 /// `application/json` (issue #20): the real Codex Responses client feeds the
 /// response byte stream to its SSE parser regardless of the upstream

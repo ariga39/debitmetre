@@ -230,8 +230,16 @@ async fn route_v1(gateway: Gateway, req: Request<Body>) -> Response {
     // the single declared-effort fact (issue #36). The body is still forwarded
     // chunk-by-chunk unchanged, so opaque request streaming is preserved and
     // nothing waits for the body to finish before the upstream is contacted.
-    let declared_effort: Option<Arc<StdMutex<RequestEffort>>> =
-        meter.then(|| Arc::new(StdMutex::new(RequestEffort::default())));
+    // The observer's private decode hint is the forwarded Content-Encoding; it
+    // is read from the caller's headers and never altered when forwarding.
+    let declared_effort: Option<Arc<StdMutex<RequestEffort>>> = meter.then(|| {
+        let encoding = req
+            .headers()
+            .get(header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        Arc::new(StdMutex::new(RequestEffort::new(encoding)))
+    });
 
     // Build the upstream URL from the fixed base plus the caller's relative
     // path below `/v1`, preserving the caller's raw (including percent-encoded
@@ -527,7 +535,8 @@ fn record_audit(
 /// fact (issue #36) while leaving every chunk byte-for-byte unchanged and
 /// preserving incremental streaming: a chunk is observed and handed on without
 /// waiting for the rest of the body. Mirroring happens only when an observer is
-/// supplied (the metered Responses paths); the mirror is parsed exactly once by
+/// supplied (the metered Responses paths); the mirror is decoded (per the
+/// forwarded `Content-Encoding`) and parsed exactly once by
 /// [`usage::RequestEffort`] — at audit finalization, or at clean EOF when the
 /// HTTP stack polls that far — and is never retained here.
 struct RequestMirrorStream<S> {

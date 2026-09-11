@@ -148,9 +148,11 @@ contributes one accepted lifecycle, and one whose record carries a non-null usag
 (partial usage still counts). An unfinished trailing line left by a process crash is ignored with a warning
 while earlier complete records are still summarized. Warnings go to stderr.
 
-The declared-effort observation reads an identity-encoded JSON request body for the single
-`reasoning.effort` string; the gateway does not decompress request bodies, so a compressed body leaves the
-effort unobserved and recorded as `null` (never invented).
+The declared-effort observation reads a JSON request body for the single `reasoning.effort` string. It
+decodes a private copy for the supported request encodings — none/`identity` and `zstd` (which the Codex
+client enables) — while forwarding the original bytes and `Content-Encoding` header unchanged. Any other or
+layered encoding, or a body not received before an early failure/cancel, leaves the effort unobserved and
+recorded as `null` (never invented).
 
 The summary is a local read of the audit file; it does not calculate prices, equivalent cost, or daily
 billing reports.
